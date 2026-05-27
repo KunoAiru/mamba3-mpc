@@ -65,32 +65,47 @@ class InferenceCache(NamedTuple):
 
 class Mamba2LMHeadModel(nn.Module):
     def __init__(self, args: Mamba2Config, device: Device = None):
+        # nn.Moduleクラスの基底コンストラクタ呼び出し
         super().__init__()
+        # Mamba2Configをarg、CPU or GPUをdeviceで定義する
         self.args = args
         self.device = device
 
+        # backbone：Mamba2の主要なコンポーネントを辞書型でまとめる
         self.backbone = nn.ModuleDict(
             dict(
+                # 単語埋め込み層 vocab_size(トークンのIDの次元・語彙集合の数) → d_model(単語埋め込みベクトルの次元)
                 embedding=nn.Embedding(args.vocab_size, args.d_model, device=device),
+
+                # Mamba2のレイヤーをn_layer個まで積み重ねる
                 layers=nn.ModuleList(
                     [
                         nn.ModuleDict(
                             dict(
+                                # 状態空間モデル(SSM)
                                 mixer=Mamba2(args, device=device),
+                                # RMSNormによる層正規化
                                 norm=RMSNorm(args.d_model, device=device),
                             )
                         )
                         for _ in range(args.n_layer)
                     ]
                 ),
+
+                # 最後に最終的な層正規化を行う
                 norm_f=RMSNorm(args.d_model, device=device),
             )
         )
+
+        # d_model(単語埋め込みベクトルの次元) → vocab_size(トークンIDのスコアの次元)へ変換する線形層
         self.lm_head = nn.Linear(
             args.d_model, args.vocab_size, bias=False, device=device
         )
+
+        # 入口のembeddingの重みと、出口のlm_headで最終出力された重みを共有する
         self.lm_head.weight = self.backbone.embedding.weight
 
+    # Hugging Faceから事前学習済みのMamba2の内部パラメータをおろす
     @staticmethod
     def from_pretrained(huggingface_model_id: str, device: Device = None):
         from transformers.utils import CONFIG_NAME, WEIGHTS_NAME
@@ -102,6 +117,7 @@ class Mamba2LMHeadModel(nn.Module):
         assert state_dict_path, "Failed to get huggingface state dict file"
 
         config = json.load(open(config_path))
+        # モデル構造に関わるパラメータをおろす
         args = Mamba2Config(
             d_model=config["d_model"],
             n_layer=config["n_layer"],
@@ -111,10 +127,14 @@ class Mamba2LMHeadModel(nn.Module):
 
         map_location = "cpu" if device is None else device
         state_dict = torch.load(
-            state_dict_path, weights_only=True, map_location=map_location, mmap=True
+            state_dict_path, weights_only=True, map_location=map_location, mmap=True # Hugging Faceのpath、重みのみダウンロード、CPU or GPU、メモリマッピングON
         )
+
+        # モデル定義
         model = Mamba2LMHeadModel(args, device=device)
+        # ダウンロードした重みをロード
         model.load_state_dict(state_dict)
+        # 評価（推論）モード
         model.eval()
         return model
 
@@ -133,18 +153,33 @@ class Mamba2LMHeadModel(nn.Module):
             logits: (batch, seqlen, vocab_size)
             h: updated inference cache after processing `input_ids`
         """
+
+        # 入力テキストが何トークンかを測る
         seqlen = input_ids.shape[1]
 
+        # 1トークン目の場合（h_0の場合）、各レイヤーの隠れ状態をリセット
         if h is None:
             h = [None for _ in range(self.args.n_layer)]
 
+        # 単語埋め込み処理
         x = self.backbone.embedding(input_ids)
+
+        # 全レイヤーにおいてこの処理を繰り返す
         for i, layer in enumerate(self.backbone.layers):
+
+            # 正規化を行った単語埋め込みを過去の隠れ状態h_tとともにSSM処理をおこなう
             y, h[i] = layer.mixer(layer.norm(x), h[i])
+
+            # 上の結果と、もとの単語埋め込みを足し、次レイヤーへ送る
             x = y + x
 
+        # 最後に正規化する
         x = self.backbone.norm_f(x)
+
+        # トークンIDと同じ次元に変換し、単語の予測スコアとして保持
         logits = self.lm_head(x)
+
+        # 入力トークン文の予測確率と記憶(キャッシュ)を保存
         return logits[:, :seqlen], cast(list[InferenceCache], h)
 
     def generate(
@@ -156,20 +191,31 @@ class Mamba2LMHeadModel(nn.Module):
         top_p: float = 1.0,
         eos_token_id: int = 0,
     ) -> Iterable[tuple[int, list[InferenceCache]]]:
+        
+        # prefix: 最後の1トークンを除く過去のトークンすべて
+        # tokens: 最後の1トークンだけ。これを「現在の入力」として、次の文字の予測を開始
         prefix, tokens = input_ids[:-1], input_ids[-1:].unsqueeze(0)
 
         # Process prompt
         # The input sequence to forward (non-inference path) must have length multiple that of chunk_size.
         # We split out excess tokens so that n_chunked tokens can be processed by one forward call and
         # process the rest in multiple inference steps.
+
+        # チャンクサイズに分けて処理を行う
         n_chunked = (prefix.shape[0] // self.args.chunk_size) * self.args.chunk_size
+
+        # チャンクで高速計算し、隠れ状態hを初期化
         if n_chunked > 0:
             _, h = self(prefix[:n_chunked].unsqueeze(0), None)
+
+        # チャンクから溢れたものは、hをゼロから立ち上げる
         else:
             h = [
                 InferenceCache.alloc(1, self.args, device=self.device)
                 for _ in range(self.args.n_layer)
             ]
+        
+        # 一トークンずつ順番に処理
         for i in range(n_chunked, prefix.shape[0]):
             _, h = self(prefix[i : i + 1].unsqueeze(0), h)
 
@@ -178,23 +224,34 @@ class Mamba2LMHeadModel(nn.Module):
             with torch.no_grad():
                 out, h = self(tokens, h)
             logits = out[0, -1]
+            #スコアを温度で割る
             if temperature != 1.0:
                 logits = logits / temperature
+            # Top-Kフィルター
             if top_k > 0:
+                #確率が高い順にK個だけ残す
                 indices_to_remove = logits < torch.topk(logits, k=top_k)[0][-1]
                 logits[indices_to_remove] = -torch.inf
+            # Top-Pフィルター
             if top_p < 1.0:
+                #累積確率で上位top_pのしきい値に入らないトークンは切る
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cum_probs > 0.5
+                sorted_indices_to_remove = cum_probs > top_p
                 sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
                 sorted_indices_to_remove[0] = False
                 indices_to_remove = sorted_indices[sorted_indices_to_remove]
                 logits[indices_to_remove] = -torch.inf
+            # 確率分布計算
             probs = F.softmax(logits, dim=-1)
+            # 確率分布を基に、次のトークンを予測
             next_token = torch.multinomial(probs, num_samples=1)
+
+            # 最後のトークンなら終了
             if next_token.item() == eos_token_id:
                 return
+            
+            # 作ったトークンを次の入力にセットし、決定したトークンIDと最新の隠れ状態hを呼び出し元へ送る
             tokens = next_token.unsqueeze(0)
             yield cast(int, next_token.item()), h
 
@@ -205,11 +262,16 @@ class Mamba2(nn.Module):
         self.args = args
         self.device = device
 
-        # Order: (z, x, B, C, dt)
-        #次元を拡張
+        # z, x, B, C, dtが格納されたベクトル
+        # z: ゲート（フィルター）用のデータ
+        # x: メインの入力データ
+        # B, C: 状態空間モデル（SSM）の行列データ
+        # dt: 時間のステップ幅（タイムステップ）
+        #d_model次元をd_in_proj次元へ拡張
         d_in_proj = 2 * args.d_inner + 2 * args.d_state + args.nheads
         self.in_proj = nn.Linear(args.d_model, d_in_proj, bias=False, device=device)
 
+        # 直近4トークン分のローカルな並びを混ぜ合わせるための1次元畳み込み
         conv_dim = args.d_inner + 2 * args.d_state
         self.conv1d = nn.Conv1d(
             in_channels=conv_dim,
@@ -220,11 +282,17 @@ class Mamba2(nn.Module):
             device=device,
         )
 
+        # 変数定義
+        # 時間ステップバイアス
         self.dt_bias = nn.Parameter(torch.empty(args.nheads, device=device))
+        # システム行列A（対数）
         self.A_log = nn.Parameter(torch.empty(args.nheads, device=device))
+        # 残差結合にかかる係数D
         self.D = nn.Parameter(torch.empty(args.nheads, device=device))
-        
+
+        # 正規化
         self.norm = RMSNorm(args.d_inner, device=device)
+        # d_inner次元からd_model次元へ変換
         self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=False, device=device)
 
     def forward(self, u: Tensor, h: InferenceCache | None = None):
@@ -237,11 +305,16 @@ class Mamba2(nn.Module):
             y: (batch, seqlen, d_model) output
             h: updated inference cache after processing `u`
         """
+
+        #すでに隠れ状態がある場合はstep関数を用いる
         if h:
             return self.step(u, h)
 
+        # 対数から負の実数に戻す
         A = -torch.exp(self.A_log)  # (nheads,)
+        # 次元拡張を行う
         zxbcdt = self.in_proj(u)  # (batch, seqlen, d_in_proj)
+        #巨大化したデータを、ゲート用の z、メインデータの xBC、タイムステップ（時間の進み幅）の dt の3つに切り分け
         z, xBC, dt = torch.split(
             zxbcdt,
             [
@@ -251,19 +324,28 @@ class Mamba2(nn.Module):
             ],
             dim=-1,
         )
+        # 活性化関数に通す
         dt = F.softplus(dt + self.dt_bias)  # (batch, seqlen, nheads)
 
-        # Pad or truncate xBC seqlen to d_conv
+        # 将来の1文字生成（step）のために、現在の状態を記録（パディング処理）
         conv_state = F.pad(
             rearrange(xBC, "b l d -> b d l"), (self.args.d_conv - u.shape[1], 0)
         )
-
+        # 1次元畳み込みを実行し、SiLUで活性化
         xBC = silu(
             self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, : u.shape[1], :]
         )  # (batch, seqlen, d_inner + 2 * d_state))
+        # さらに、x, B, C の3つに切り分ける
         x, B, C = torch.split(
             xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
         )
+
+        # SSMの計算処理
+        # h ： n_head（ヘッドの個数）
+        # b ： batch_size（バッチサイズ、データの個数）
+        # l ： seqlen（シーケンス長、テキストの長さ）
+        # p ： headdim （1ヘッドあたりの次元数）
+        # n ： d_state（Mambaの状態空間の次元数）
         x = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
         y, ssm_state = ssd(
             x * dt.unsqueeze(-1),
@@ -273,11 +355,17 @@ class Mamba2(nn.Module):
             self.args.chunk_size,
             device=self.device,
         )
+
+        # スキップ結合
         y = y + x * self.D.unsqueeze(-1)
+        #次元調整
         y = rearrange(y, "b l h p -> b l (h p)")
+        #正規化
         y = self.norm(y, z)
+        # d_modelに次元変換
         y = self.out_proj(y)
 
+        # 畳み込みの直近状態（conv_state）とSSMの長期記憶（ssm_state）をキャッシュに追加
         h = InferenceCache(conv_state, ssm_state)
         return y, h
 
