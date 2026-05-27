@@ -26,24 +26,27 @@ class Mamba2Config:
     d_model: int  # model dimension (D)
     n_layer: int = 24  # number of Mamba-2 layers in the language model
     d_state: int = 128  # state dimension (N)
-    d_conv: int = 4  # convolution kernel size
+    d_conv: int = 4  # convolution kernel size 直近でみるトークン数
     expand: int = 2  # expansion factor (E)
     headdim: int = 64  # head dimension (P)
     chunk_size: int = 64  # matrix partition size (Q)
     vocab_size: int = 50277
     pad_vocab_size_multiple: int = 16
 
+    # コンストラクタ後の初期化処理
     def __post_init__(self):
         self.d_inner = self.expand * self.d_model
         assert self.d_inner % self.headdim == 0
         self.nheads = self.d_inner // self.headdim
+
+        #GPUの並列計算用に、単語総数をself.pad_vocab_size_multiple(=16)の倍数になるように調整
         if self.vocab_size % self.pad_vocab_size_multiple != 0:
             self.vocab_size += (
                 self.pad_vocab_size_multiple
                 - self.vocab_size % self.pad_vocab_size_multiple
             )
 
-
+#1トークンずつ推論する際のキャッシュ
 class InferenceCache(NamedTuple):
     conv_state: Tensor  # (batch, d_inner + 2 * d_state, d_conv)
     ssm_state: Tensor  # (batch, nheads, headdim, d_state)
@@ -203,6 +206,7 @@ class Mamba2(nn.Module):
         self.device = device
 
         # Order: (z, x, B, C, dt)
+        #次元を拡張
         d_in_proj = 2 * args.d_inner + 2 * args.d_state + args.nheads
         self.in_proj = nn.Linear(args.d_model, d_in_proj, bias=False, device=device)
 
@@ -219,6 +223,7 @@ class Mamba2(nn.Module):
         self.dt_bias = nn.Parameter(torch.empty(args.nheads, device=device))
         self.A_log = nn.Parameter(torch.empty(args.nheads, device=device))
         self.D = nn.Parameter(torch.empty(args.nheads, device=device))
+        
         self.norm = RMSNorm(args.d_inner, device=device)
         self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=False, device=device)
 
