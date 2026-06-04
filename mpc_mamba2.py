@@ -106,6 +106,12 @@ class Mamba2LMHeadModel(nn.Module):
         # 入口のembeddingの重みと、出口のlm_headで最終出力された重みを共有する
         self.lm_head.weight = self.backbone.embedding.weight
 
+        self.lm_head_weight_crypt = None
+    
+    def encrypt_lm_head(self):
+        if self.lm_head_weight_crypt is None:
+            self.lm_head_weight_crypt = crypten.cryptensor(self.lm_head.weight)
+
     # Hugging Faceから事前学習済みのMamba2の内部パラメータをおろす
     @staticmethod
     def from_pretrained(huggingface_model_id: str, device: Device = None):
@@ -179,7 +185,8 @@ class Mamba2LMHeadModel(nn.Module):
         x = self.backbone.norm_f(x)
 
         # トークンIDと同じ次元に変換し、単語の予測スコアとして保持
-        logits = self.lm_head(x)
+        self.encrypt_lm_head()
+        logits = x.matmul(self.lm_head_weight_crypt.t())
 
         # 入力トークン文の予測確率と記憶(キャッシュ)を保存
         return logits[:, :seqlen], cast(list[InferenceCache], h)
@@ -238,14 +245,14 @@ class Mamba2LMHeadModel(nn.Module):
             if top_p < 1.0:
                 #累積確率で上位top_pのしきい値に入らないトークンは切る
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cum_probs > top_p
+                cum_probs = torch.cumsum(MPCMamba_Function.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cum_probs > 0.5
                 sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
                 sorted_indices_to_remove[0] = False
                 indices_to_remove = sorted_indices[sorted_indices_to_remove]
                 logits[indices_to_remove] = -torch.inf
             # 確率分布計算
-            probs = F.softmax(logits, dim=-1)
+            probs = MPCMamba_Function.softmax(logits, dim=-1)
             # 確率分布を基に、次のトークンを予測
             next_token = torch.multinomial(probs, num_samples=1)
 
@@ -287,16 +294,79 @@ class Mamba2(nn.Module):
 
         # 変数定義
         # 時間ステップバイアス
-        self.dt_bias = crypten.cryptensor(nn.Parameter(torch.empty(args.nheads, device=device)))
+        self.dt_bias = nn.Parameter(torch.empty(args.nheads, device=device))
         # システム行列A（対数）
-        self.A_log = crypten.cryptensor(nn.Parameter(torch.empty(args.nheads, device=device)))
+        self.A_log = nn.Parameter(torch.empty(args.nheads, device=device))
         # 残差結合にかかる係数D
-        self.D = crypten.cryptensor(nn.Parameter(torch.empty(args.nheads, device=device)))
+        self.D = nn.Parameter(torch.empty(args.nheads, device=device))
 
         # 正規化
         self.norm = RMSNorm(args.d_inner, device=device)
         # d_inner次元からd_model次元へ変換
         self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=False, device=device)
+
+        self.in_proj_weight_crypt = None
+        self.out_proj_weight_crypt = None
+        self.dt_bias_crypt = None
+        self.A_log_crypt = None
+        self.D_crypt = None
+        self.conv1d_weight_crypt = None
+        self.conv1d_bias_crypt = None
+    
+    def encrypt_weights(self):
+        if self.in_proj_weight_crypt is None:
+            self.in_proj_weight_crypt = crypten.cryptensor(self.in_proj.weight)
+            self.out_proj_weight_crypt = crypten.cryptensor(self.out_proj.weight)
+            self.dt_bias_crypt = crypten.cryptensor(self.dt_bias)
+            self.A_log_crypt = crypten.cryptensor(self.A_log)
+            self.D_crypt = crypten.cryptensor(self.D)
+        
+        if self.conv1d_weight_crypt is None:
+            self.conv1d_weight_crypt = crypten.cryptensor(self.conv1d.weight)
+            self.conv1d_bias_crypt = crypten.cryptensor(self.conv1d.bias)
+    
+    def causal_conv1d(self, x: Tensor) -> Tensor:
+        """CrypTen（MPC）環境で動作する1D畳み込み
+        
+        Arguments:
+            x: (batch, seqlen, conv_dim) の暗号化テンソル
+            
+        Returns:
+            (batch, seqlen, conv_dim) の畳み込み後の暗号化テンソル
+        """
+        # 形状の確認と変換 (batch, seqlen, conv_dim) -> (batch, conv_dim, seqlen)
+        x_t = x.transpose(1, 2)
+        batch, conv_dim, seqlen = x_t.shape[0], x_t.shape[1], x_t.shape[2]
+        
+        # 重み (conv_dim, 1, kernel_size) -> (conv_dim, kernel_size) に平坦化
+        _, _, k_size = self.conv1d_weight_crypt.shape
+        w_flat = self.conv1d_weight_crypt.view(conv_dim, k_size)
+        
+        # 1. 因果性（Causal）を担保するため、時系列の「前側（左側）」にだけパディングを行う
+        pad_left = k_size - 1
+        zeros_pad = crypten.zeros(batch, conv_dim, pad_left, device=self.device)
+        x_padded = crypten.cat([zeros_pad, x_t], dim=-1) # (batch, conv_dim, pad_left + seqlen)
+        
+        # 出力用のバッファを0で初期化
+        conv_out = crypten.zeros(batch, conv_dim, seqlen, device=self.device)
+        
+        # 2. カーネルサイズ分（Mamba2の標準設定では4回）のループで畳み込みを計算
+        # 各カーネル位置の重みを、時間軸をずらした入力スライスに対して要素ごとに掛け算して足し合わせる
+        for k in range(k_size):
+            # 重みのk番目の要素: (conv_dim, 1)
+            w_k = w_flat[:, k].unsqueeze(-1)
+            
+            # 入力から対応する時間軸の窓（ウィンドウ）を抽出
+            slice_k = x_padded[:, :, k : k + seqlen]
+            
+            # 積和算
+            conv_out = conv_out + (slice_k * w_k)
+            
+        # 3. バイアスの加算: (conv_dim,) -> (1, conv_dim, 1) に拡張して足す
+        conv_out = conv_out + self.conv1d_bias_crypt.unsqueeze(0).unsqueeze(-1)
+        
+        # 形状を元に戻す (batch, conv_dim, seqlen) -> (batch, seqlen, conv_dim)
+        return conv_out.transpose(1, 2)
 
     def forward(self, u: Tensor, h: InferenceCache | None = None):
         """
@@ -308,15 +378,25 @@ class Mamba2(nn.Module):
             y: (batch, seqlen, d_model) output
             h: updated inference cache after processing `u`
         """
+        # SSMの計算処理
+        # h ： n_head（ヘッドの個数）
+        # b ： batch_size（バッチサイズ、データの個数）
+        # l ： seqlen（シーケンス長、テキストの長さ）
+        # p ： headdim （1ヘッドあたりの次元数）
+        # n ： d_state（Mambaの状態空間の次元数）
+
+        self.encrypt_weights()
 
         #すでに隠れ状態がある場合はstep関数を用いる
         if h:
             return self.step(u, h)
 
         # 対数から負の実数に戻す
-        A = -torch.exp(self.A_log)  # (nheads,)
+        A = -MPCMamba_Function.exp(self.A_log)  # (nheads,)
+
         # 次元拡張を行う
-        zxbcdt = self.in_proj(u)  # (batch, seqlen, d_in_proj)
+        zxbcdt = u.matmul(self.in_proj_weight_crypt.t()) # (batch, seqlen, d_in_proj)
+        
         #巨大化したデータを、ゲート用の z、メインデータの xBC、タイムステップ（時間の進み幅）の dt の3つに切り分け
         z, xBC, dt = torch.split(
             zxbcdt,
@@ -331,42 +411,45 @@ class Mamba2(nn.Module):
         dt = MPCMamba_Function.softplus(dt + self.dt_bias)  # (batch, seqlen, nheads)
 
         # 将来の1文字生成（step）のために、現在の状態を記録（パディング処理）
-        conv_state = F.pad(
-            rearrange(xBC, "b l d -> b d l"), (self.args.d_conv - u.shape[1], 0)
-        )
+        # xBC = (b l d -> b d l)
+        xBC_t = xBC.transpose(1, 2)
+        conv_state = MPCMamba_Function.pad_left(xBC_t,self.args.d_conv - u.shape[1])
         # 1次元畳み込みを実行し、SiLUで活性化
-        xBC = MPCMamba_Function.silu(
-            self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, : u.shape[1], :]
-        )  # (batch, seqlen, d_inner + 2 * d_state))
+        xBC = self.causal_conv1d(xBC)
+        xBC = MPCMamba_Function.silu(xBC) # (batch, seqlen, d_inner + 2 * d_state)
+
         # さらに、x, B, C の3つに切り分ける
         x, B, C = torch.split(
             xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
         )
 
-        # SSMの計算処理
-        # h ： n_head（ヘッドの個数）
-        # b ： batch_size（バッチサイズ、データの個数）
-        # l ： seqlen（シーケンス長、テキストの長さ）
-        # p ： headdim （1ヘッドあたりの次元数）
-        # n ： d_state（Mambaの状態空間の次元数）
-        x = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
+
+        # x = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
+        batch, seqlen, d_inner = x.shape[0], x.shape[1], x.shape[2]
+        nheads = d_inner // self.args.headdim
+        x.view(batch, seqlen, nheads, self.args.headdim)
+
         y, ssm_state = ssd(
             x * dt.unsqueeze(-1),
             A * dt,
-            rearrange(B, "b l n -> b l 1 n"),
-            rearrange(C, "b l n -> b l 1 n"),
+            B.unsqueeze(-2),  # rearrange(B, "b l n -> b l 1 n") 
+            C.unsqueeze(-2),  # rearrange(C, "b l n -> b l 1 n") 
             self.args.chunk_size,
             device=self.device,
         )
 
         # スキップ結合
         y = y + x * self.D.unsqueeze(-1)
+
         #次元調整
-        y = rearrange(y, "b l h p -> b l (h p)")
+        # y = rearrange(y, "b l h p -> b l (h p)")
+        batch, seqlen, nheads, headdim = y.shape[0], y.shape[1], y.shape[2], y.shape[3]
+        y.view(batch, seqlen, nheads * headdim)
+
         #正規化
         y = self.norm(y, z)
         # d_modelに次元変換
-        y = self.out_proj(y)
+        y = y.matmul(self.out_proj_weight_crypt.t())
 
         # 畳み込みの直近状態（conv_state）とSSMの長期記憶（ssm_state）をキャッシュに追加
         h = InferenceCache(conv_state, ssm_state)
@@ -395,7 +478,7 @@ class Mamba2(nn.Module):
         assert u.shape[1] == 1, "Only one token can be decoded per inference step"
 
         # 次元をd_in_projとして巨大化する
-        zxbcdt = self.in_proj(u.squeeze(1))  # (batch, d_in_proj)
+        zxbcdt = u.squeeze(1).matmul(self.in_proj_weight_crypt.t())  # (batch, d_in_proj)
         z, xBC, dt = torch.split(
             zxbcdt,
             [
@@ -415,16 +498,16 @@ class Mamba2(nn.Module):
             h.conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
         )
         xBC += self.conv1d.bias
-        xBC = silu(xBC)
+        xBC = MPCMamba_Function.silu(xBC)
 
         x, B, C = torch.split(
             xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
         )
-        A = -torch.exp(self.A_log)  # (nheads,)
+        A = -MPCMamba_Function.exp(self.A_log)  # (nheads,)
 
         # SSMの更新式
-        dt = F.softplus(dt + self.dt_bias)  # (batch, nheads)
-        dA = torch.exp(dt * A)  # (batch, nheads)
+        dt = MPCMamba_Function.softplus(dt + self.dt_bias)  # (batch, nheads)
+        dA = MPCMamba_Function.exp(dt * A)  # (batch, nheads)
         x = rearrange(x, "b (h p) -> b h p", p=self.args.headdim)
         dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
         h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
@@ -434,7 +517,7 @@ class Mamba2(nn.Module):
         # 後処理（正規化と次元整理）
         y = rearrange(y, "b h p -> b (h p)")
         y = self.norm(y, z)
-        y = self.out_proj(y)
+        y = y.matmul(self.out_proj_weight_crypt.t())
 
         return y.unsqueeze(1), h
 
@@ -501,13 +584,13 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
 
     # 1. Compute the output for each intra-chunk (diagonal blocks)
     # Y =(L⊙CB)X
-    L = torch.exp(segsum(A, device=device))
+    L = MPCMamba_Function.exp(segsum(A, device=device))
     Y_diag = torch.einsum("bclhn, bcshn, bhcls, bcshp -> bclhp", C, B, L, x)
 
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
     # チャンク内の各単語の記憶が、チャンクの境界線に到達した時にどれくらい弱まっているか（引き継ぎ用の減衰率）を計算
-    decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
+    decay_states = MPCMamba_Function.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
     states = torch.einsum("bclhn, bhcl, bclhp -> bchpn", B, decay_states, x)
 
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
@@ -517,14 +600,14 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
         initial_states = torch.zeros_like(states[:, :1])
     states = torch.cat([initial_states, states], dim=1)
     # チャンクをまたぐ時の減衰
-    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0)), device=device))
+    decay_chunk = MPCMamba_Function.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0)), device=device))
     new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
     states, final_state = new_states[:, :-1], new_states[:, -1]
 
     # 4. Compute state -> output conversion per chunk
     # (left term of low-rank factorization of off-diagonal blocks; C terms)
     # 前のチャンクから引き継いだ記憶を、各チャンク内の64文字の単語たちに分配して、フェーズ1の結果と足し算
-    state_decay_out = torch.exp(A_cumsum)
+    state_decay_out = MPCMamba_Function.exp(A_cumsum)
     Y_off = torch.einsum("bclhn, bchpn, bhcl -> bclhp", C, states, state_decay_out)
 
     # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
@@ -546,24 +629,26 @@ class RMSNorm(nn.Module):
         return x * MPCMamba_Function.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
 class MPCMamba_Function():
-
-    def exp(self,x,n=8):
+    @staticmethod
+    def exp(x,n=8):
         power_of_two = 2 ** n
         y = 1.0 + x / power_of_two
         for _ in range(n):
             y = y * y
         return y
 
-    def reciprocal(self,x,n=8):
-        y = 3.0*self.exp(0.5-x) + 0.0003
+    @staticmethod
+    def reciprocal(x,n=8):
+        y = 3.0*MPCMamba_Function.self.exp(0.5-x) + 0.0003
         for _ in range(n):
             y = y * (2.0-x*y)
         return y
 
-    def log(self,x,n=3,k=5):
-        y = x/120.0 - 20.0 * self.exp(-2.0*x-1.0) + 3.0
+    @staticmethod
+    def log(x,n=3,k=5):
+        y = x/120.0 - 20.0 * MPCMamba_Function.self.exp(-2.0*x-1.0) + 3.0
         for _ in range(n):
-            t = 1.0 - x * self.exp(-y)
+            t = 1.0 - x * MPCMamba_Function.exp(-y)
             
             # ln(1 - t_n)のテイラー項
             taylor_term = 0.0
@@ -574,9 +659,10 @@ class MPCMamba_Function():
             y = y - taylor_term
         return y
 
-    def rsqrt(self,x,y_initial=None,n=5):
+    @staticmethod
+    def rsqrt(x,y_initial=None,n=5):
         if y_initial is None:
-            y = (2.2*self.exp(-(x*0.5 + 0.2)) + 0.2 -x) * 2 ** (-10)
+            y = (2.2*MPCMamba_Function.self.exp(-(x*0.5 + 0.2)) + 0.2 -x) * 2 ** (-10)
         else:
             y = y_initial if crypten.is_encrypted_tensor(y_initial) else crypten.cryptensor(y_initial)
 
@@ -584,15 +670,49 @@ class MPCMamba_Function():
             y = 0.5 * y * (3.0 - x * y * y)
         return y
     
-    def silu(self,x):
-        base = self.exp(-x) + 1.0
-        r = self.rsqrt(base,y_initial=0.75)
+    @staticmethod
+    def silu(x):
+        base = MPCMamba_Function.self.exp(-x) + 1.0
+        r = MPCMamba_Function.rsqrt(base,y_initial=0.75)
         sign_flag = (1.0 - x.sign()) / 2.0
         r = sign_flag * (1.0-r) + (1.0-sign_flag)*r
         return base * r
     
-    def softplus(self,x):
-        return self.log(self.exp(x) + 1.0)
+    @staticmethod
+    def softplus(x):
+        return MPCMamba_Function.log(MPCMamba_Function.exp(x) + 1.0)
+    
+    @staticmethod
+    def pad_left(x, pad_size):
+        """
+        F.pad(x, (pad_size, 0)) の代替 (左側/過去方向へのゼロパディング)
+
+        Arguments:
+            x: (batch, dim, seqlen) などの暗号化テンソル
+        """
+        if pad_size <= 0:
+            return x
+        shape = list(x.shape)
+        shape[-1] = pad_size
+        zeros = crypten.zeros(*shape, device=x.device)
+        return crypten.cat([zeros, x], dim=-1)
+    
+    @staticmethod
+    def mpc_repeat_inter_chunk(x, T):
+        """
+        einops.repeat(x, "... d -> ... d e", e=T) の代替 (segsum用)
+
+        Arguments:
+            x: (..., T) 形状のテンソルを (..., T, T) に拡張
+        """
+        # 末尾に次元を追加して (..., T, 1) にする
+        x_expanded = x.unsqueeze(-1)
+        
+        # Tのサイズを持つ「1」で満たされた平文テンソルを掛けてブロードキャストさせる
+        ones = torch.ones([1] * (len(x.shape)) + [T], device=x.device)
+        return x_expanded * ones
+
+
     
 
 
