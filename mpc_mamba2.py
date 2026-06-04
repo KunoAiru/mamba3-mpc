@@ -14,9 +14,10 @@ from dataclasses import dataclass
 from typing import Iterable, NamedTuple, TypeAlias, cast
 
 import torch
-import torch.nn.functional as F
 from einops import rearrange, repeat
+import crypten
 from torch import LongTensor, Tensor, nn
+
 
 Device: TypeAlias = str | torch.device | None
 
@@ -54,12 +55,12 @@ class InferenceCache(NamedTuple):
     @staticmethod
     def alloc(batch_size: int, args: Mamba2Config, device: Device = None):
         return InferenceCache(
-            torch.zeros(
+            crypten.cryptensor(torch.zeros(
                 batch_size, args.d_inner + 2 * args.d_state, args.d_conv, device=device
-            ),
-            torch.zeros(
+            )),
+            crypten.cryptensor(torch.zeros(
                 batch_size, args.nheads, args.headdim, args.d_state, device=device
-            ),
+            )),
         )
 
 
@@ -163,6 +164,7 @@ class Mamba2LMHeadModel(nn.Module):
 
         # 単語埋め込み処理
         x = self.backbone.embedding(input_ids)
+        x = crypten.cryptensor(x)
 
         # 全レイヤーにおいてこの処理を繰り返す
         for i, layer in enumerate(self.backbone.layers):
@@ -253,6 +255,7 @@ class Mamba2LMHeadModel(nn.Module):
             
             # 作ったトークンを次の入力にセットし、決定したトークンIDと最新の隠れ状態hを呼び出し元へ送る
             tokens = next_token.unsqueeze(0)
+
             yield cast(int, next_token.item()), h
 
 
@@ -284,11 +287,11 @@ class Mamba2(nn.Module):
 
         # 変数定義
         # 時間ステップバイアス
-        self.dt_bias = nn.Parameter(torch.empty(args.nheads, device=device))
+        self.dt_bias = crypten.cryptensor(nn.Parameter(torch.empty(args.nheads, device=device)))
         # システム行列A（対数）
-        self.A_log = nn.Parameter(torch.empty(args.nheads, device=device))
+        self.A_log = crypten.cryptensor(nn.Parameter(torch.empty(args.nheads, device=device)))
         # 残差結合にかかる係数D
-        self.D = nn.Parameter(torch.empty(args.nheads, device=device))
+        self.D = crypten.cryptensor(nn.Parameter(torch.empty(args.nheads, device=device)))
 
         # 正規化
         self.norm = RMSNorm(args.d_inner, device=device)
@@ -325,14 +328,14 @@ class Mamba2(nn.Module):
             dim=-1,
         )
         # 活性化関数に通す
-        dt = F.softplus(dt + self.dt_bias)  # (batch, seqlen, nheads)
+        dt = MPCMamba_Function.softplus(dt + self.dt_bias)  # (batch, seqlen, nheads)
 
         # 将来の1文字生成（step）のために、現在の状態を記録（パディング処理）
         conv_state = F.pad(
             rearrange(xBC, "b l d -> b d l"), (self.args.d_conv - u.shape[1], 0)
         )
         # 1次元畳み込みを実行し、SiLUで活性化
-        xBC = silu(
+        xBC = MPCMamba_Function.silu(
             self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, : u.shape[1], :]
         )  # (batch, seqlen, d_inner + 2 * d_state))
         # さらに、x, B, C の3つに切り分ける
@@ -343,7 +346,7 @@ class Mamba2(nn.Module):
         # SSMの計算処理
         # h ： n_head（ヘッドの個数）
         # b ： batch_size（バッチサイズ、データの個数）
-        # l ： seqlen（シーケンス長、テキストの長さ、時刻）
+        # l ： seqlen（シーケンス長、テキストの長さ）
         # p ： headdim （1ヘッドあたりの次元数）
         # n ： d_state（Mambaの状態空間の次元数）
         x = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
@@ -532,25 +535,69 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
 
 class RMSNorm(nn.Module):
     def __init__(self, d: int, eps: float = 1e-5, device: Device = None):
-        """Gated Root Mean Square Layer Normalization
-
-        Paper: https://arxiv.org/abs/1910.07467
-        """
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(d, device=device))
 
     def forward(self, x, z=None):
         if z is not None:
-            x = x * silu(z)
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+            x = x * MPCMamba_Function.silu(z)
+        
+        return x * MPCMamba_Function.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+class MPCMamba_Function():
+
+    def exp(self,x,n=8):
+        power_of_two = 2 ** n
+        y = 1.0 + x / power_of_two
+        for _ in range(n):
+            y = y * y
+        return y
+
+    def reciprocal(self,x,n=8):
+        y = 3.0*self.exp(0.5-x) + 0.0003
+        for _ in range(n):
+            y = y * (2.0-x*y)
+        return y
+
+    def log(self,x,n=3,k=5):
+        y = x/120.0 - 20.0 * self.exp(-2.0*x-1.0) + 3.0
+        for _ in range(n):
+            t = 1.0 - x * self.exp(-y)
+            
+            # ln(1 - t_n)のテイラー項
+            taylor_term = 0.0
+            t_pow = 1.0
+            for i in range(1,k+1):
+                t_pow = t_pow * t
+                taylor_term += (1.0/i) * t_pow
+            y = y - taylor_term
+        return y
+
+    def rsqrt(self,x,y_initial=None,n=5):
+        if y_initial is None:
+            y = (2.2*self.exp(-(x*0.5 + 0.2)) + 0.2 -x) * 2 ** (-10)
+        else:
+            y = y_initial if crypten.is_encrypted_tensor(y_initial) else crypten.cryptensor(y_initial)
+
+        for _ in range(n):
+            y = 0.5 * y * (3.0 - x * y * y)
+        return y
+    
+    def silu(self,x):
+        base = self.exp(-x) + 1.0
+        r = self.rsqrt(base,y_initial=0.75)
+        sign_flag = (1.0 - x.sign()) / 2.0
+        r = sign_flag * (1.0-r) + (1.0-sign_flag)*r
+        return base * r
+    
+    def softplus(self,x):
+        return self.log(self.exp(x) + 1.0)
+    
 
 
-def silu(x):
-    """Applies the Sigmoid Linear Unit (SiLU), element-wise.
 
-    Define this manually since torch's version doesn't seem to work on MPS.
-    """
-    return x * F.sigmoid(x)
+    
+
 
 
