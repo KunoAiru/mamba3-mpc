@@ -490,14 +490,22 @@ class Mamba2(nn.Module):
         )
 
         # 隠れ状態4トークン分に対して、左に1つずらす（一番古いトークンを捨てる）
-        h.conv_state.copy_(torch.roll(h.conv_state, shifts=-1, dims=-1))
+        # h.conv_state.copy_(torch.roll(h.conv_state, shifts=-1, dims=-1))
+        shifted = h.conv_state[:, :, 1:]
+
         # 空いた一番右端（最新の位置）に、今入ってきた新入りトークン（xBC）を滑り込ませる
-        h.conv_state[:, :, -1] = xBC
+        #h.conv_state[:, :, -1] = xBC
+        h.conv_state = crypten.cat([shifted, xBC.unsqueeze(-1)], dim=-1)
+        
+
         # 直近4トークン分に対して、畳み込み計算（掛け算と足し算）を行う
-        xBC = torch.sum(
-            h.conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
-        )
-        xBC += self.conv1d.bias
+        #xBC = torch.sum(h.conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)
+        #xBC += self.conv1d.bias
+        c_dim, _, k_size = self.conv1d_weight_crypt.shape
+        w_flat = self.conv1d_weight_crypt.view(c_dim, k_size)    
+        xBC = (h.conv_state * w_flat.unsqueeze(0)).sum(dim=-1)
+        xBC = xBC + self.conv1d_bias_crypt.unsqueeze(0)
+
         xBC = MPCMamba_Function.silu(xBC)
 
         x, B, C = torch.split(
@@ -508,14 +516,38 @@ class Mamba2(nn.Module):
         # SSMの更新式
         dt = MPCMamba_Function.softplus(dt + self.dt_bias)  # (batch, nheads)
         dA = MPCMamba_Function.exp(dt * A)  # (batch, nheads)
-        x = rearrange(x, "b (h p) -> b h p", p=self.args.headdim)
-        dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
-        h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-        y = torch.einsum("bhpn, bn -> bhp", h.ssm_state, C)
-        y = y + rearrange(self.D, "h -> h 1") * x
+        # x = rearrange(x, "b (h p) -> b h p", p=self.args.headdim)
+        batch,d_inner = x[0],x[1]
+        nheads = d_inner // self.args.headdim
+        x.view(batch,nheads,self.args.headdim)
+
+        # dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
+        # 各テンソルに unsqueeze を適用して4次元 (batch, nheads, headdim, d_state) に拡張し、要素積
+        # dt: (b, h) -> (b, h, 1, 1)
+        # B:  (b, n) -> (b, 1, 1, n)
+        # x:  (b, h, p) -> (b, h, p, 1)
+        dBx = dt.unsqueeze(-1).unsqueeze(-1) * B.unsqueeze(1).unsqueeze(1) * x.unsqueeze(-1)
+
+        # h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+        dA_4d = dA.unsqueeze(-1).unsqueeze(-1)
+        h.ssm_state = h.ssm_state * dA_4d + dBx
+
+        # y = torch.einsum("bhpn, bn -> bhp", h.ssm_state, C)
+        # C: (batch, d_state) -> (batch, 1, 1, d_state)
+        C_4d = C.unsqueeze(1).unsqueeze(1)
+        # y：(batch, nheads, headdim, d_state) 
+        y_4d = h.ssm_state * C_4d
+        # 縮小したい次元（最後の次元: dim=-1）方向に足し合わせ(batch, nheads, headdim) に次元縮小
+        y = y_4d.sum(dim=-1)
+
+        # y = y + rearrange(self.D, "h -> h 1") * x
+        y = y + self.D.unsqueeze(-1) * x
 
         # 後処理（正規化と次元整理）
-        y = rearrange(y, "b h p -> b (h p)")
+        # y = rearrange(y, "b h p -> b (h p)")
+        batch,nheads,headdim = y.shape[0],y.shape[1],y.shape[2]
+        y.view(batch,nheads*headdim)
+
         y = self.norm(y, z)
         y = y.matmul(self.out_proj_weight_crypt.t())
 
@@ -533,18 +565,24 @@ def segsum(x: Tensor, device: Device = None) -> Tensor:
     # x = ΔtA
     T = x.size(-1)
     # T x T次元の行列変換
-    x = repeat(x, "... d -> ... d e", e=T)
+    # x = repeat(x, "... d -> ... d e", e=T)
+    x = MPCMamba_Function.mpc_repeat_inter_chunk(x,T)
 
     # 対角線下がTrue(対角線を含まない)、上がFalseとなるMaskを生成し、未来からの影響をシャットアウト
-    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=-1)
-    x = x.masked_fill(~mask, 0)
+    # mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=-1)
+    # x = x.masked_fill(~mask, 0)
+    tril_mask_minus1 = torch.tril(torch.ones(T, T, device=device), diagonal=-1)
+    x = x * tril_mask_minus1
 
     # 行列の縦方向（dim=-2）に向かって、数値を上から下へと累積足し算（累積和）
     x_segsum = torch.cumsum(x, dim=-2)
 
     # 対角線下がTrue(対角線を含む)、上がFalseとなるMaskを生成し、未来の状態を0にする（exp(-∞)=0）
-    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=0)
-    x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+    # mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=0)
+    # x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+    triu_mask_0 = torch.triu(torch.ones(T, T, device=device), diagonal=1)
+    inf_replacement = triu_mask_0 * -10000.0
+    x_segsum = x_segsum + inf_replacement
 
     # 累積減衰行列を返す
     return x_segsum
