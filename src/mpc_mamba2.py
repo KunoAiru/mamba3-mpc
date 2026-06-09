@@ -356,7 +356,7 @@ class Mamba2(nn.Module):
         
         # 重み (conv_dim, 1, kernel_size) -> (conv_dim, kernel_size) に平坦化
         _, _, k_size = self.conv1d_weight_crypt.shape
-        w_flat = self.conv1d_weight_crypt.view(conv_dim, k_size)
+        w_flat = self.conv1d_weight_crypt.reshape(conv_dim, k_size)
         
         # 1. 因果性（Causal）を担保するため、時系列の「前側（左側）」にだけパディングを行う
         pad_left = k_size - 1
@@ -408,7 +408,7 @@ class Mamba2(nn.Module):
             return self.step(u, h)
 
         # 対数から負の実数に戻す
-        A = -MPCMamba_Function.exp(self.A_log)  # (nheads,)
+        A = -MPCMamba_Function.exp(self.A_log_crypt)  # (nheads,)
 
         # 次元拡張を行う
         zxbcdt = u.matmul(self.in_proj_weight_crypt.t()) # (batch, seqlen, d_in_proj)
@@ -437,32 +437,30 @@ class Mamba2(nn.Module):
         idx1 = self.args.d_inner
         idx2 = idx1 + self.args.d_state
         
-        x = zxbcdt[..., :idx1]
-        B = zxbcdt[..., idx1:idx2]
-        C = zxbcdt[..., idx2:]
+        x = xBC[..., :idx1]
+        B = xBC[..., idx1:idx2]
+        C = xBC[..., idx2:]
 
 
         # x = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
         batch, seqlen, d_inner = x.shape[0], x.shape[1], x.shape[2]
         nheads = d_inner // self.args.headdim
-        x = x.view(batch, seqlen, nheads, self.args.headdim)
+        x = x.reshape(batch, seqlen, nheads, self.args.headdim)
 
         y, ssm_state = self.ssd(
             x * dt.unsqueeze(-1),
             A * dt,
             B.unsqueeze(-2),  # rearrange(B, "b l n -> b l 1 n") 
             C.unsqueeze(-2),  # rearrange(C, "b l n -> b l 1 n") 
-            self.args.chunk_size,
-            device=self.device,
         )
 
         # スキップ結合
-        y = y + x * self.D.unsqueeze(-1)
+        y = y + x * self.D_crypt.unsqueeze(-1)
 
         #次元調整
         # y = rearrange(y, "b l h p -> b l (h p)")
         batch, seqlen, nheads, headdim = y.shape[0], y.shape[1], y.shape[2], y.shape[3]
-        y = y.view(batch, seqlen, nheads * headdim)
+        y = y.reshape(batch, seqlen, nheads * headdim)
 
         #正規化
         y = self.norm(y, z)
@@ -518,7 +516,7 @@ class Mamba2(nn.Module):
         #xBC = torch.sum(h.conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)
         #xBC += self.conv1d.bias
         c_dim, _, k_size = self.conv1d_weight_crypt.shape
-        w_flat = self.conv1d_weight_crypt.view(c_dim, k_size)    
+        w_flat = self.conv1d_weight_crypt.reshape(c_dim, k_size)    
         xBC = (h.conv_state * w_flat.unsqueeze(0)).sum(dim=-1)
         xBC = xBC + self.conv1d_bias_crypt.unsqueeze(0)
 
@@ -528,19 +526,19 @@ class Mamba2(nn.Module):
         idx1 = self.args.d_inner
         idx2 = idx1 + self.args.d_state
         
-        x = zxbcdt[..., :idx1]
-        B = zxbcdt[..., idx1:idx2]
-        C = zxbcdt[..., idx2:]
+        x = xBC[..., :idx1]
+        B = xBC[..., idx1:idx2]
+        C = xBC[..., idx2:]
 
-        A = -MPCMamba_Function.exp(self.A_log)  # (nheads,)
+        A = -MPCMamba_Function.exp(self.A_log_crypt)  # (nheads,)
 
         # SSMの更新式
-        dt = MPCMamba_Function.softplus(dt + self.dt_bias)  # (batch, nheads)
+        dt = MPCMamba_Function.softplus(dt + self.dt_bias_crypt)  # (batch, nheads)
         dA = MPCMamba_Function.exp(dt * A)  # (batch, nheads)
         # x = rearrange(x, "b (h p) -> b h p", p=self.args.headdim)
         batch,d_inner = x.shape[0],x.shape[1]
         nheads = d_inner // self.args.headdim
-        x = x.view(batch,nheads,self.args.headdim)
+        x = x.reshape(batch,nheads,self.args.headdim)
 
         # dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
         # 各テンソルに unsqueeze を適用して4次元 (batch, nheads, headdim, d_state) に拡張し、要素積
@@ -562,12 +560,12 @@ class Mamba2(nn.Module):
         y = y_4d.sum(dim=-1)
 
         # y = y + rearrange(self.D, "h -> h 1") * x
-        y = y + self.D.unsqueeze(-1) * x
+        y = y + self.D_crypt.unsqueeze(-1) * x
 
         # 後処理（正規化と次元整理）
         # y = rearrange(y, "b h p -> b (h p)")
         batch,nheads,headdim = y.shape[0],y.shape[1],y.shape[2]
-        y = y.view(batch,nheads*headdim)
+        y = y.reshape(batch,nheads*headdim)
 
         y = self.norm(y, z)
         y = y.matmul(self.out_proj_weight_crypt.t())
@@ -575,7 +573,7 @@ class Mamba2(nn.Module):
         return y.unsqueeze(1), h
     
     # Mamba2(SSD)の処理
-    def ssd(self,x, A, B, C, chunk_size, initial_states=None, device: Device = None):
+    def ssd(self,x, A, B, C,initial_states=None):
         """Structed State Space Duality (SSD) - the core of Mamba-2
 
         This is almost the exact same minimal SSD code from the blog post.
@@ -589,11 +587,14 @@ class Mamba2(nn.Module):
         Return
             y: (batch, seqlen, n_heads, d_head)
 
+            self.args.chunk_size,
+            device=self.device,
+
         Source
          1. https://tridao.me/blog/2024/mamba2-part3-algorithm/
          2. https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L34-L78
         """
-        assert x.shape[1] % chunk_size == 0
+        assert x.shape[1] % self.args.chunk_size == 0
 
         # Rearrange into chunks 
         # Step 1, 2 and 4 of SSD can be computed in parallel for each chunk across devices (sequence parallel)
@@ -604,18 +605,18 @@ class Mamba2(nn.Module):
         #]
         #A = rearrange(A, "b c l h -> b h c l")
         batch_size = x.shape[0]
-        num_chunks = x.shape[1] // chunk_size
-        x = x.view(batch_size, num_chunks, chunk_size, self.args.nheads, self.args.headdim)
-        A = A.view(batch_size, self.args.headdim, num_chunks, chunk_size)
-        B = B.view(batch_size, num_chunks, chunk_size, self.args.d_state)
-        C = C.view(batch_size, num_chunks, chunk_size, self.args.d_state)
+        num_chunks = x.shape[1] // self.args.chunk_size
+        x = x.reshape(batch_size, num_chunks, self.args.chunk_size, self.args.nheads, self.args.headdim)
+        A = A.reshape(batch_size, self.args.headdim, num_chunks, self.args.chunk_size)
+        B = B.reshape(batch_size, num_chunks, self.args.chunk_size, self.args.d_state)
+        C = C.reshape(batch_size, num_chunks, self.args.chunk_size, self.args.d_state)
 
         # チャンクの内部（長さ l の方向）に向かって、減衰率 A の累積足し算を行い、キープしておく
         A_cumsum = MPCMamba_Function.cumsum(A, dim=-1)
 
         # 1. Compute the output for each intra-chunk (diagonal blocks)
         # Y =(L⊙CB)X
-        L = MPCMamba_Function.exp(segsum(A, device=device))
+        L = MPCMamba_Function.exp(segsum(A, device=self.device))
 
         #Y_diag = torch.einsum("bclhn, bcshn, bhcls, bcshp -> bclhp", C, B, L, x)
         # ターゲット形状: (b, c, l, s, h, p, n) になるように拡張
@@ -653,7 +654,7 @@ class Mamba2(nn.Module):
         states = crypten.cat([crypt_initial_states, states], dim=1)
 
         # チャンクをまたぐ時の減衰
-        decay_chunk = MPCMamba_Function.exp(segsum(MPCMamba_Function.pad_left(A_cumsum[:, :, :, -1], 1), device=device))
+        decay_chunk = MPCMamba_Function.exp(segsum(MPCMamba_Function.pad_left(A_cumsum[:, :, :, -1], 1), device=self.device))
 
         #new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
         new_states_5d = decay_chunk.unsqueeze(4).unsqueeze(5) * states.unsqueeze(1)
@@ -679,7 +680,7 @@ class Mamba2(nn.Module):
         # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
         #Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
         Y_combined = Y_diag + Y_off
-        Y = Y_combined.view(batch_size, num_chunks * chunk_size, self.args.nheads, self.args.headdim)
+        Y = Y_combined.reshape(batch_size, num_chunks * self.args.chunk_size, self.args.nheads, self.args.headdim)
 
         return Y, final_state
 
