@@ -9,7 +9,6 @@ A minimal, single-file implementation of the Mamba-2 model in PyTorch.
 > Paper: https://arxiv.org/abs/2405.21060
 """
 
-import json
 from dataclasses import dataclass
 from typing import Iterable, NamedTuple, TypeAlias, cast
 
@@ -66,7 +65,6 @@ class InferenceCache(NamedTuple):
             crypt_cache2
         )
 
-
 class Mamba2LMHeadModel(nn.Module):
     def __init__(self, args: Mamba2Config, device: Device = None):
         # nn.Moduleクラスの基底コンストラクタ呼び出し
@@ -74,7 +72,6 @@ class Mamba2LMHeadModel(nn.Module):
         # Mamba2Configをarg、CPU or GPUをdeviceで定義する
         self.args = args
         self.device = device
-        crypten.init()
 
         # backbone：Mamba2の主要なコンポーネントを辞書型でまとめる
         self.backbone = nn.ModuleDict(
@@ -115,39 +112,19 @@ class Mamba2LMHeadModel(nn.Module):
     def encrypt_lm_head(self):
         if self.lm_head_weight_crypt is None:
             self.lm_head_weight_crypt = crypten.cryptensor(self.lm_head.weight)
-
-    # Hugging Faceから事前学習済みのMamba2の内部パラメータをおろす
-    @staticmethod
-    def from_pretrained(huggingface_model_id: str, device: Device = None):
-        from transformers.utils import CONFIG_NAME, WEIGHTS_NAME
-        from transformers.utils.hub import cached_file
-
-        config_path = cached_file(huggingface_model_id, CONFIG_NAME)
-        assert config_path, "Failed to get huggingface config file"
-        state_dict_path = cached_file(huggingface_model_id, WEIGHTS_NAME)
-        assert state_dict_path, "Failed to get huggingface state dict file"
-
-        config = json.load(open(config_path))
-        # モデル構造に関わるパラメータをおろす
-        args = Mamba2Config(
-            d_model=config["d_model"],
-            n_layer=config["n_layer"],
-            vocab_size=config["vocab_size"],
-            pad_vocab_size_multiple=config["pad_vocab_size_multiple"],
-        )
-
-        map_location = "cpu" if device is None else device
-        state_dict = torch.load(
-            state_dict_path, weights_only=True, map_location=map_location, mmap=True # Hugging Faceのpath、重みのみダウンロード、CPU or GPU、メモリマッピングON
-        )
-
-        # モデル定義
-        model = Mamba2LMHeadModel(args, device=device)
-        # ダウンロードした重みをロード
-        model.load_state_dict(state_dict)
-        # 評価（推論）モード
-        model.eval()
-        return model
+    
+    def load_encrypted_state_dict(self, encrypted_state_dict):
+        """
+        ユーザー側で暗号化された重み（CrypTensorの辞書）を受け取り、
+        モデルのパラメータを完全に暗号化状態に置き換える
+        """
+        for name, r_tensor in encrypted_state_dict.items():
+            attrs = name.split('.')
+            submodule = self
+            for attr in attrs[:-1]:
+                submodule = getattr(submodule, attr)
+            
+            setattr(submodule, attrs[-1], r_tensor)
 
     def forward(
         self, input_ids: LongTensor, h: list[InferenceCache] | list[None] | None = None
@@ -437,17 +414,15 @@ class Mamba2(nn.Module):
         zxbcdt = u.matmul(self.in_proj_weight_crypt.t()) # (batch, seqlen, d_in_proj)
         
         #巨大化したデータを、ゲート用の z、メインデータの xBC、タイムステップ（時間の進み幅）の dt の3つに切り分け
-        z, xBC, dt = torch.split(
-            zxbcdt,
-            [
-                self.args.d_inner,
-                self.args.d_inner + 2 * self.args.d_state,
-                self.args.nheads,
-            ],
-            dim=-1,
-        )
+        #z, xBC, dt = torch.split(zxbcdt,[self.args.d_inner,self.args.d_inner + 2 * self.args.d_state,self.args.nheads,],dim=-1,)
+        idx1 = self.args.d_inner
+        idx2 = idx1 + (self.args.d_inner + 2 * self.args.d_state)
+        z = zxbcdt[..., :idx1]
+        xBC = zxbcdt[..., idx1:idx2]
+        dt = zxbcdt[..., idx2:]
+
         # 活性化関数に通す
-        dt = MPCMamba_Function.softplus(dt + self.dt_bias)  # (batch, seqlen, nheads)
+        dt = MPCMamba_Function.softplus(dt + self.dt_bias_crypt)  # (batch, seqlen, nheads)
 
         # 将来の1文字生成（step）のために、現在の状態を記録（パディング処理）
         # xBC = (b l d -> b d l)
@@ -458,17 +433,21 @@ class Mamba2(nn.Module):
         xBC = MPCMamba_Function.silu(xBC) # (batch, seqlen, d_inner + 2 * d_state)
 
         # さらに、x, B, C の3つに切り分ける
-        x, B, C = torch.split(
-            xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
-        )
+        #x, B, C = torch.split(xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1)
+        idx1 = self.args.d_inner
+        idx2 = idx1 + self.args.d_state
+        
+        x = zxbcdt[..., :idx1]
+        B = zxbcdt[..., idx1:idx2]
+        C = zxbcdt[..., idx2:]
 
 
         # x = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
         batch, seqlen, d_inner = x.shape[0], x.shape[1], x.shape[2]
         nheads = d_inner // self.args.headdim
-        x.view(batch, seqlen, nheads, self.args.headdim)
+        x = x.view(batch, seqlen, nheads, self.args.headdim)
 
-        y, ssm_state = ssd(
+        y, ssm_state = self.ssd(
             x * dt.unsqueeze(-1),
             A * dt,
             B.unsqueeze(-2),  # rearrange(B, "b l n -> b l 1 n") 
@@ -483,7 +462,7 @@ class Mamba2(nn.Module):
         #次元調整
         # y = rearrange(y, "b l h p -> b l (h p)")
         batch, seqlen, nheads, headdim = y.shape[0], y.shape[1], y.shape[2], y.shape[3]
-        y.view(batch, seqlen, nheads * headdim)
+        y = y.view(batch, seqlen, nheads * headdim)
 
         #正規化
         y = self.norm(y, z)
@@ -518,15 +497,13 @@ class Mamba2(nn.Module):
 
         # 次元をd_in_projとして巨大化する
         zxbcdt = u.squeeze(1).matmul(self.in_proj_weight_crypt.t())  # (batch, d_in_proj)
-        z, xBC, dt = torch.split(
-            zxbcdt,
-            [
-                self.args.d_inner,
-                self.args.d_inner + 2 * self.args.d_state,
-                self.args.nheads,
-            ],
-            dim=-1,
-        )
+        #z, xBC, dt = torch.split(zxbcdt,[self.args.d_inner,self.args.d_inner + 2 * self.args.d_state,self.args.nheads,],dim=-1,)
+        idx1 = self.args.d_inner
+        idx2 = idx1 + (self.args.d_inner + 2 * self.args.d_state)
+
+        z = zxbcdt[..., :idx1]
+        xBC = zxbcdt[..., idx1:idx2]
+        dt = zxbcdt[..., idx2:]
 
         # 隠れ状態4トークン分に対して、左に1つずらす（一番古いトークンを捨てる）
         # h.conv_state.copy_(torch.roll(h.conv_state, shifts=-1, dims=-1))
@@ -547,18 +524,23 @@ class Mamba2(nn.Module):
 
         xBC = MPCMamba_Function.silu(xBC)
 
-        x, B, C = torch.split(
-            xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
-        )
+        #x, B, C = torch.split(xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1)
+        idx1 = self.args.d_inner
+        idx2 = idx1 + self.args.d_state
+        
+        x = zxbcdt[..., :idx1]
+        B = zxbcdt[..., idx1:idx2]
+        C = zxbcdt[..., idx2:]
+
         A = -MPCMamba_Function.exp(self.A_log)  # (nheads,)
 
         # SSMの更新式
         dt = MPCMamba_Function.softplus(dt + self.dt_bias)  # (batch, nheads)
         dA = MPCMamba_Function.exp(dt * A)  # (batch, nheads)
         # x = rearrange(x, "b (h p) -> b h p", p=self.args.headdim)
-        batch,d_inner = x[0],x[1]
+        batch,d_inner = x.shape[0],x.shape[1]
         nheads = d_inner // self.args.headdim
-        x.view(batch,nheads,self.args.headdim)
+        x = x.view(batch,nheads,self.args.headdim)
 
         # dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
         # 各テンソルに unsqueeze を適用して4次元 (batch, nheads, headdim, d_state) に拡張し、要素積
@@ -585,12 +567,121 @@ class Mamba2(nn.Module):
         # 後処理（正規化と次元整理）
         # y = rearrange(y, "b h p -> b (h p)")
         batch,nheads,headdim = y.shape[0],y.shape[1],y.shape[2]
-        y.view(batch,nheads*headdim)
+        y = y.view(batch,nheads*headdim)
 
         y = self.norm(y, z)
         y = y.matmul(self.out_proj_weight_crypt.t())
 
         return y.unsqueeze(1), h
+    
+    # Mamba2(SSD)の処理
+    def ssd(self,x, A, B, C, chunk_size, initial_states=None, device: Device = None):
+        """Structed State Space Duality (SSD) - the core of Mamba-2
+
+        This is almost the exact same minimal SSD code from the blog post.
+
+        Arguments
+            x: (batch, seqlen, n_heads, d_head)
+            A: (batch, seqlen, n_heads)
+            B: (batch, seqlen, n_heads, d_state)
+            C: (batch, seqlen, n_heads, d_state)
+
+        Return
+            y: (batch, seqlen, n_heads, d_head)
+
+        Source
+         1. https://tridao.me/blog/2024/mamba2-part3-algorithm/
+         2. https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L34-L78
+        """
+        assert x.shape[1] % chunk_size == 0
+
+        # Rearrange into chunks 
+        # Step 1, 2 and 4 of SSD can be computed in parallel for each chunk across devices (sequence parallel)
+        # This is not implemented and left as an exercise for the reader 😜
+        # データをチャンク（塊）にぶつ切りにしている場所（GPUによる高速化計算は未実装）
+        #x, A, B, C = [
+        #    rearrange(m, "b (c l) ... -> b c l ...", l=chunk_size) for m in (x, A, B, C)
+        #]
+        #A = rearrange(A, "b c l h -> b h c l")
+        batch_size = x.shape[0]
+        num_chunks = x.shape[1] // chunk_size
+        x = x.view(batch_size, num_chunks, chunk_size, self.args.nheads, self.args.headdim)
+        A = A.view(batch_size, self.args.headdim, num_chunks, chunk_size)
+        B = B.view(batch_size, num_chunks, chunk_size, self.args.d_state)
+        C = C.view(batch_size, num_chunks, chunk_size, self.args.d_state)
+
+        # チャンクの内部（長さ l の方向）に向かって、減衰率 A の累積足し算を行い、キープしておく
+        A_cumsum = MPCMamba_Function.cumsum(A, dim=-1)
+
+        # 1. Compute the output for each intra-chunk (diagonal blocks)
+        # Y =(L⊙CB)X
+        L = MPCMamba_Function.exp(segsum(A, device=device))
+
+        #Y_diag = torch.einsum("bclhn, bcshn, bhcls, bcshp -> bclhp", C, B, L, x)
+        # ターゲット形状: (b, c, l, s, h, p, n) になるように拡張
+        # C: (b, c, l, n) -> (b, c, l, 1, 1, 1, n)
+        # B: (b, c, s, n) -> (b, c, 1, s, 1, 1, n)
+        # L: (b, c, l, s, h) -> (b, c, l, s, h, 1, 1)
+        # x: (b, c, s, h, p) -> (b, c, 1, s, h, p, 1)
+        Y_diag_5d = (
+            C.unsqueeze(3).unsqueeze(4).unsqueeze(5) * B.unsqueeze(2).unsqueeze(4).unsqueeze(5) * L.unsqueeze(-1).unsqueeze(-1) * x.unsqueeze(2).unsqueeze(-1)
+        )
+        Y_diag = Y_diag_5d.sum(dim=-1).sum(dim=3) # 結果: (b, c, l, h, p)
+
+
+        # 2. Compute the state for each intra-chunk
+        # (right term of low-rank factorization of off-diagonal blocks; B terms)
+        # チャンク内の各単語の記憶が、チャンクの境界線に到達した時にどれくらい弱まっているか（引き継ぎ用の減衰率）を計算
+        decay_states = MPCMamba_Function.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
+
+        #states = torch.einsum("bclhn, bhcl, bclhp -> bchpn", B, decay_states, x)
+        # ターゲット形状: (b, c, l, h, p, n)
+        # B:            (b, c, l, n)    -> (b, c, l, 1, 1, n)
+        # decay_states: (b, c, l, h)    -> (b, c, l, h, 1, 1)
+        # x:            (b, c, l, h, p) -> (b, c, l, h, p, 1)
+        states_5d = (
+            B.unsqueeze(3).unsqueeze(4) * decay_states.unsqueeze(4).unsqueeze(-1) * x.unsqueeze(-1)
+        )
+        states = states_5d.sum(dim=2) # 結果: (b, c, h, p, n)
+
+        # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
+        # (middle term of factorization of off-diag blocks; A terms)
+        # 過去の履歴がない場合は初期化
+        if initial_states is None:
+            initial_states = torch.zeros_like(states[:, :1])
+            crypt_initial_states = crypten.cryptensor(initial_states)
+        states = crypten.cat([crypt_initial_states, states], dim=1)
+
+        # チャンクをまたぐ時の減衰
+        decay_chunk = MPCMamba_Function.exp(segsum(MPCMamba_Function.pad_left(A_cumsum[:, :, :, -1], 1), device=device))
+
+        #new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
+        new_states_5d = decay_chunk.unsqueeze(4).unsqueeze(5) * states.unsqueeze(1)
+        new_states = new_states_5d.sum(dim=2)
+
+        states, final_state = new_states[:, :-1], new_states[:, -1]
+
+        # 4. Compute state -> output conversion per chunk
+        # (left term of low-rank factorization of off-diagonal blocks; C terms)
+        # 前のチャンクから引き継いだ記憶を、各チャンク内の64文字の単語たちに分配して、フェーズ1の結果と足し算
+        state_decay_out = MPCMamba_Function.exp(A_cumsum)
+
+        #Y_off = torch.einsum("bclhn, bchpn, bhcl -> bclhp", C, states, state_decay_out)
+        # ターゲット形状: (b, c, l, h, p, n)
+        # C:               (b, c, l, n) -> (b, c, l, 1, 1, n)
+        # states:          (b, c, h, p, n) -> (b, c, 1, h, p, n)
+        # state_decay_out: (b, c, l, h) -> (b, c, l, h, 1, 1)
+        Y_off_5d = (
+            C.unsqueeze(3).unsqueeze(4) * states.unsqueeze(2) * state_decay_out.unsqueeze(4).unsqueeze(-1)
+        )
+        Y_off = Y_off_5d.sum(dim=-1)
+
+        # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
+        #Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
+        Y_combined = Y_diag + Y_off
+        Y = Y_combined.view(batch_size, num_chunks * chunk_size, self.args.nheads, self.args.headdim)
+
+        return Y, final_state
 
 # 「過去から現在にいたるまで、記憶がどれくらい連続して減衰（忘却）してきたか」の累積合計を、巨大な行列として一発で計算するための下請け関数
 def segsum(x: Tensor, device: Device = None) -> Tensor:
@@ -625,115 +716,6 @@ def segsum(x: Tensor, device: Device = None) -> Tensor:
 
     # 累積減衰行列を返す
     return x_segsum
-
-# Mamba2(SSD)の処理
-def ssd(self,x, A, B, C, chunk_size, initial_states=None, device: Device = None):
-    """Structed State Space Duality (SSD) - the core of Mamba-2
-
-    This is almost the exact same minimal SSD code from the blog post.
-
-    Arguments
-        x: (batch, seqlen, n_heads, d_head)
-        A: (batch, seqlen, n_heads)
-        B: (batch, seqlen, n_heads, d_state)
-        C: (batch, seqlen, n_heads, d_state)
-
-    Return
-        y: (batch, seqlen, n_heads, d_head)
-
-    Source
-     1. https://tridao.me/blog/2024/mamba2-part3-algorithm/
-     2. https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L34-L78
-    """
-    assert x.shape[1] % chunk_size == 0
-
-    # Rearrange into chunks 
-    # Step 1, 2 and 4 of SSD can be computed in parallel for each chunk across devices (sequence parallel)
-    # This is not implemented and left as an exercise for the reader 😜
-    # データをチャンク（塊）にぶつ切りにしている場所（GPUによる高速化計算は未実装）
-    #x, A, B, C = [
-    #    rearrange(m, "b (c l) ... -> b c l ...", l=chunk_size) for m in (x, A, B, C)
-    #]
-    #A = rearrange(A, "b c l h -> b h c l")
-    batch_size = x.shape[0]
-    num_chunks = x.shape[1] // chunk_size
-    x = x.view(batch_size, num_chunks, chunk_size, self.args.nheads, self.args.headdim)
-    A = A.view(batch_size, self.args.headdim, num_chunks, chunk_size)
-    B = B.view(batch_size, num_chunks, chunk_size, self.args.d_state)
-    C = C.view(batch_size, num_chunks, chunk_size, self.args.d_state)
-
-    # チャンクの内部（長さ l の方向）に向かって、減衰率 A の累積足し算を行い、キープしておく
-    A_cumsum = MPCMamba_Function.cumsum(A, dim=-1)
-
-    # 1. Compute the output for each intra-chunk (diagonal blocks)
-    # Y =(L⊙CB)X
-    L = MPCMamba_Function.exp(segsum(A, device=device))
-
-    #Y_diag = torch.einsum("bclhn, bcshn, bhcls, bcshp -> bclhp", C, B, L, x)
-    # ターゲット形状: (b, c, l, s, h, p, n) になるように拡張
-    # C: (b, c, l, n) -> (b, c, l, 1, 1, 1, n)
-    # B: (b, c, s, n) -> (b, c, 1, s, 1, 1, n)
-    # L: (b, c, l, s, h) -> (b, c, l, s, h, 1, 1)
-    # x: (b, c, s, h, p) -> (b, c, 1, s, h, p, 1)
-    Y_diag_5d = (
-        C.unsqueeze(3).unsqueeze(4).unsqueeze(5) * B.unsqueeze(2).unsqueeze(4).unsqueeze(5) * L.unsqueeze(-1).unsqueeze(-1) * x.unsqueeze(2).unsqueeze(-1)
-    )
-    Y_diag = Y_diag_5d.sum(dim=-1).sum(dim=3) # 結果: (b, c, l, h, p)
-
-
-    # 2. Compute the state for each intra-chunk
-    # (right term of low-rank factorization of off-diagonal blocks; B terms)
-    # チャンク内の各単語の記憶が、チャンクの境界線に到達した時にどれくらい弱まっているか（引き継ぎ用の減衰率）を計算
-    decay_states = MPCMamba_Function.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
-
-    #states = torch.einsum("bclhn, bhcl, bclhp -> bchpn", B, decay_states, x)
-    # ターゲット形状: (b, c, l, h, p, n)
-    # B:            (b, c, l, n)    -> (b, c, l, 1, 1, n)
-    # decay_states: (b, c, l, h)    -> (b, c, l, h, 1, 1)
-    # x:            (b, c, l, h, p) -> (b, c, l, h, p, 1)
-    states_5d = (
-        B.unsqueeze(3).unsqueeze(4) * decay_states.unsqueeze(4).unsqueeze(-1) * x.unsqueeze(-1)
-    )
-    states = states_5d.sum(dim=2) # 結果: (b, c, h, p, n)
-
-    # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
-    # (middle term of factorization of off-diag blocks; A terms)
-    # 過去の履歴がない場合は初期化
-    if initial_states is None:
-        initial_states = torch.zeros_like(states[:, :1])
-        crypt_initial_states = crypten.cryptensor(initial_states)
-    states = crypten.cat([crypt_initial_states, states], dim=1)
-
-    # チャンクをまたぐ時の減衰
-    decay_chunk = MPCMamba_Function.exp(segsum(MPCMamba_Function.pad_left(A_cumsum[:, :, :, -1], 1), device=device))
-
-    #new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
-    new_states_5d = decay_chunk.unsqueeze(4).unsqueeze(5) * states.unsqueeze(1)
-    new_states = new_states_5d.sum(dim=2)
-
-    states, final_state = new_states[:, :-1], new_states[:, -1]
-
-    # 4. Compute state -> output conversion per chunk
-    # (left term of low-rank factorization of off-diagonal blocks; C terms)
-    # 前のチャンクから引き継いだ記憶を、各チャンク内の64文字の単語たちに分配して、フェーズ1の結果と足し算
-    state_decay_out = MPCMamba_Function.exp(A_cumsum)
-
-    #Y_off = torch.einsum("bclhn, bchpn, bhcl -> bclhp", C, states, state_decay_out)
-    # ターゲット形状: (b, c, l, h, p, n)
-    # C:               (b, c, l, n) -> (b, c, l, 1, 1, n)
-    # states:          (b, c, h, p, n) -> (b, c, 1, h, p, n)
-    # state_decay_out: (b, c, l, h) -> (b, c, l, h, 1, 1)
-    Y_off_5d = (
-        C.unsqueeze(3).unsqueeze(4) * states.unsqueeze(2) * state_decay_out.unsqueeze(4).unsqueeze(-1)
-    )
-    Y_off = Y_off_5d.sum(dim=-1)
-
-    # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
-    #Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
-    Y_combined = Y_diag + Y_off
-    Y = Y_combined.view(batch_size, num_chunks * chunk_size, self.args.nheads, self.args.headdim)
-
-    return Y, final_state
 
 
 class RMSNorm(nn.Module):

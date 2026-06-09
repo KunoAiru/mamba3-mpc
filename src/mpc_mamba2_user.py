@@ -1,7 +1,12 @@
 import torch
 import crypten
 import time
-import mpc_mamba2
+import json
+from typing import TypeAlias
+from mpc_mamba2 import Mamba2LMHeadModel,Mamba2Config
+from transformers import AutoTokenizer
+
+Device: TypeAlias = str | torch.device | None
 
 generation_config = dict(
     max_new_length=200,
@@ -10,21 +15,62 @@ generation_config = dict(
     top_p=1.0,
 )
 
+# Hugging Faceから事前学習済みのMamba2の内部パラメータをおろす
+def from_pretrained(huggingface_model_id: str, device: Device = None):
+    from transformers.utils import CONFIG_NAME, WEIGHTS_NAME
+    from transformers.utils.hub import cached_file
+
+    config_path = cached_file(huggingface_model_id, CONFIG_NAME)
+    assert config_path, "Failed to get huggingface config file"
+    state_dict_path = cached_file(huggingface_model_id, WEIGHTS_NAME)
+    assert state_dict_path, "Failed to get huggingface state dict file"
+    config = json.load(open(config_path))
+
+    # モデル構造に関わるパラメータをおろす
+    args = Mamba2Config(
+        d_model=config["d_model"],
+        n_layer=config["n_layer"],
+        vocab_size=config["vocab_size"],
+        pad_vocab_size_multiple=config["pad_vocab_size_multiple"],
+    )
+    map_location = "cpu" if device is None else device
+    state_dict = torch.load(
+        state_dict_path, weights_only=True, map_location=map_location, mmap=True # Hugging Faceのpath、重みのみダウンロード、CPU or GPU、メモリマッピングON
+    )
+    # モデル定義
+    model = Mamba2LMHeadModel(args, device=device)
+    # ダウンロードした重みをロード
+    model.load_state_dict(state_dict)
+
+    return model
+
+def client_load_and_encrypt_model(model_id,device: Device = None):
+    """
+    ユーザーの手元（安全な環境）で平文モデルを読み込み、
+    それを暗号化テンソル（シェア）に変換したもので新たなモデルを作成する関数
+    """
+
+    plain_model = from_pretrained(model_id,device) 
+
+    encrypted_weights = {}
+    for name, param in plain_model.state_dict().items():
+        encrypted_weights[name] = crypten.cryptensor(param)
+    
+    mpc_model = Mamba2LMHeadModel(plain_model.args) 
+    # 先ほど暗号化した重みを流し込む
+    mpc_model.load_encrypted_state_dict(encrypted_weights)
+
+    mpc_model.eval()
+        
+    return mpc_model
+
 def user_generate(
-    mpc_model: mpc_mamba2.Mamba2LMHeadModel, 
+    mpc_model: Mamba2LMHeadModel, 
     prompt: str, 
     tokenizer, 
     generation_config: dict=generation_config, 
     show_perf=True
 ):
-    device=None
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-    elif torch.backends.mps.is_available():
-        device = torch.device('mps')
-    else:
-        device = torch.device('cpu')
-
     """
     ユーザーの手元（クライアントサイド）で実行するメイン生成ループ関数。
     """
@@ -73,8 +119,6 @@ def user_generate(
         # サーバーから返ってきた「ロジットのシェア」をユーザーの手元だけで復号する
         # これにより logits_plain は (vocab_size,) の普通のPyTorchテンソル（平文）になる
         logits_plain = logits_mpc.get_plain_text().squeeze(0).squeeze(0)
-        
-
 
         # 「平文」の処理
         if temperature != 1.0:
@@ -121,3 +165,22 @@ def user_generate(
         print('\n\n---')
         print(f'Prompt eval | tokens: {input_ids.shape[0]} | elapsed: {prompt_eval_elapsed:.2f}s | tok/s: {input_ids.shape[0] / prompt_eval_elapsed:.2f}')
         print(f'Generation | tokens: {n_generated} | elapsed: {elapsed:.2f}s | tok/s: {n_generated / elapsed:.2f}')
+
+if __name__ == "__main__":
+    crypten.init()
+
+
+    device=None
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
+
+    
+    model = client_load_and_encrypt_model("state-spaces/mamba2-1.3b", device=device)
+    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    user_generate(model,"Mamba-2 with MPC is",tokenizer)
