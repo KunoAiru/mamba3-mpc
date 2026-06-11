@@ -1,5 +1,5 @@
 """
-mamba2-minimal
+mpcmamba2-minimal
 ==============
 
 A minimal, single-file implementation of the Mamba-2 model in PyTorch.
@@ -14,6 +14,7 @@ from typing import Iterable, NamedTuple, TypeAlias, cast
 
 import torch
 import crypten
+from crypten.mpc import MPCTensor
 from torch import LongTensor, Tensor, nn
 
 
@@ -622,10 +623,11 @@ class Mamba2(nn.Module):
         # ターゲット形状: (b, c, l, s, h, p, n) になるように拡張
         # C: (b, c, l, n) -> (b, c, l, 1, 1, 1, n)
         # B: (b, c, s, n) -> (b, c, 1, s, 1, 1, n)
-        # L: (b, c, l, s, h) -> (b, c, l, s, h, 1, 1)
+        # L: (b, h, c, l, s) -> (b, c, l, s, h, 1, 1)
         # x: (b, c, s, h, p) -> (b, c, 1, s, h, p, 1)
+        L_perm = L.permute(0, 2, 3, 4, 1)
         Y_diag_5d = (
-            C.unsqueeze(3).unsqueeze(4).unsqueeze(5) * B.unsqueeze(2).unsqueeze(4).unsqueeze(5) * L.unsqueeze(-1).unsqueeze(-1) * x.unsqueeze(2).unsqueeze(-1)
+            C.unsqueeze(3).unsqueeze(4).unsqueeze(5) * B.unsqueeze(2).unsqueeze(4).unsqueeze(5) * L_perm.unsqueeze(-1).unsqueeze(-1) * x.unsqueeze(2).unsqueeze(-1)
         )
         Y_diag = Y_diag_5d.sum(dim=-1).sum(dim=3) # 結果: (b, c, l, h, p)
 
@@ -638,12 +640,13 @@ class Mamba2(nn.Module):
         #states = torch.einsum("bclhn, bhcl, bclhp -> bchpn", B, decay_states, x)
         # ターゲット形状: (b, c, l, h, p, n)
         # B:            (b, c, l, n)    -> (b, c, l, 1, 1, n)
-        # decay_states: (b, c, l, h)    -> (b, c, l, h, 1, 1)
+        # decay_states: (b, h, c, l)    -> (b, c, l, h, 1, 1)
         # x:            (b, c, l, h, p) -> (b, c, l, h, p, 1)
-        states_5d = (
-            B.unsqueeze(3).unsqueeze(4) * decay_states.unsqueeze(4).unsqueeze(-1) * x.unsqueeze(-1)
+        decay_states_perm = decay_states.permute(0, 2, 3, 1)
+        states_6d = (
+            B.unsqueeze(3).unsqueeze(4) * decay_states_perm.unsqueeze(4).unsqueeze(-1) * x.unsqueeze(-1)
         )
-        states = states_5d.sum(dim=2) # 結果: (b, c, h, p, n)
+        states = states_6d.sum(dim=2) # 結果: (b, c, h, p, n)
 
         # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
         # (middle term of factorization of off-diag blocks; A terms)
@@ -657,8 +660,13 @@ class Mamba2(nn.Module):
         decay_chunk = MPCMamba_Function.exp(segsum(MPCMamba_Function.pad_left(A_cumsum[:, :, :, -1], 1), device=self.device))
 
         #new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
-        new_states_5d = decay_chunk.unsqueeze(4).unsqueeze(5) * states.unsqueeze(1)
-        new_states = new_states_5d.sum(dim=2)
+        decay_chunk_exp = decay_chunk.unsqueeze(-1).unsqueeze(-1) # (b, h, z, c, 1, 1)
+        # states を (b, c, h, p, n) -> (b, h, 1, c, p, n) に変形
+        states_perm = states.permute(0, 2, 1, 3, 4).unsqueeze(2)
+        
+        new_states_6d = decay_chunk_exp * states_perm
+        new_states = new_states_6d.sum(dim=3) # -> (b, h, z, p, n)
+        new_states = new_states.permute(0, 2, 1, 3, 4) #-> (b, z, h, p, n)
 
         states, final_state = new_states[:, :-1], new_states[:, -1]
 
@@ -671,11 +679,12 @@ class Mamba2(nn.Module):
         # ターゲット形状: (b, c, l, h, p, n)
         # C:               (b, c, l, n) -> (b, c, l, 1, 1, n)
         # states:          (b, c, h, p, n) -> (b, c, 1, h, p, n)
-        # state_decay_out: (b, c, l, h) -> (b, c, l, h, 1, 1)
-        Y_off_5d = (
+        # state_decay_out: (b, h, c, l) -> (b, c, l, h, 1, 1)
+        state_decay_out_perm = state_decay_out.permute(0, 2, 3, 1)
+        Y_off_6d = (
             C.unsqueeze(3).unsqueeze(4) * states.unsqueeze(2) * state_decay_out.unsqueeze(4).unsqueeze(-1)
         )
-        Y_off = Y_off_5d.sum(dim=-1)
+        Y_off = Y_off_6d.sum(dim=-1)
 
         # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
         #Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
@@ -713,7 +722,7 @@ def segsum(x: Tensor, device: Device = None) -> Tensor:
     # x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
     triu_mask_0 = torch.triu(torch.ones(T, T, device=device), diagonal=1)
     keep_mask = 1 - triu_mask_0
-    x_segsum = x_segsum * keep_mask + triu_mask_0 * (-10000.0)
+    x_segsum = x_segsum * crypten.cryptensor(keep_mask) + crypten.cryptensor(triu_mask_0) * (-10000.0)
 
     # 累積減衰行列を返す
     return x_segsum
@@ -733,57 +742,28 @@ class RMSNorm(nn.Module):
 
 class MPCMamba_Function():
     @staticmethod
-    def exp(x,n=8):
-        power_of_two = 2 ** n
-        y = 1.0 + x / power_of_two
-        for _ in range(n):
-            y = y * y
-        return y
+    def exp(x : MPCTensor) -> MPCTensor:
+        return x.exp()
 
     @staticmethod
-    def reciprocal(x,n=8):
-        y = 3.0*MPCMamba_Function.exp(0.5-x) + 0.0003
-        for _ in range(n):
-            y = y * (2.0-x*y)
-        return y
+    def reciprocal(x : MPCTensor) -> MPCTensor:
+        return x.reciprocal()
 
     @staticmethod
-    def log(x,n=3,k=5):
-        y = x/120.0 - 20.0 * MPCMamba_Function.exp(-2.0*x-1.0) + 3.0
-        for _ in range(n):
-            t = 1.0 - x * MPCMamba_Function.exp(-y)
-            
-            # ln(1 - t_n)のテイラー項
-            taylor_term = 0.0
-            t_pow = 1.0
-            for i in range(1,k+1):
-                t_pow = t_pow * t
-                taylor_term += (1.0/i) * t_pow
-            y = y - taylor_term
-        return y
+    def log(x : MPCTensor) -> MPCTensor:
+        return x.log()
 
     @staticmethod
-    def rsqrt(x,y_initial=None,n=5):
-        if y_initial is None:
-            y = (2.2*MPCMamba_Function.exp(-(x*0.5 + 0.2)) + 0.2 -x) * 2 ** (-10)
-        else:
-            y = y_initial if crypten.is_encrypted_tensor(y_initial) else crypten.cryptensor(y_initial)
-
-        for _ in range(n):
-            y = 0.5 * y * (3.0 - x * y * y)
-        return y
+    def rsqrt(x : MPCTensor) -> MPCTensor:
+        return x.inv_sqrt()
     
     @staticmethod
-    def silu(x):
-        base = MPCMamba_Function.exp(-x) + 1.0
-        r = MPCMamba_Function.rsqrt(base,y_initial=0.75)
-        sign_flag = (1.0 - x.sign()) / 2.0
-        r = sign_flag * (1.0-r) + (1.0-sign_flag)*r
-        return base * r
+    def silu(x : MPCTensor) -> MPCTensor:
+        return x * x.sigmoid()
     
     @staticmethod
-    def softplus(x):
-        return MPCMamba_Function.log(MPCMamba_Function.exp(x) + 1.0)
+    def softplus(x : MPCTensor) -> MPCTensor:
+        return (x.exp() + 1.0).log()
     
     @staticmethod
     def pad_left(x, pad_size):
@@ -812,7 +792,7 @@ class MPCMamba_Function():
         x_expanded = x.unsqueeze(-1)
         
         # Tのサイズを持つ「1」で満たされた平文テンソルを掛けてブロードキャストさせる
-        ones = torch.zeros([1] * (len(x.shape)) + [T], device=x.device)
+        ones = torch.ones([1] * (len(x.shape)) + [T], device=x.device)
         ones = crypten.cryptensor(ones)
         return x_expanded * ones
     
