@@ -54,9 +54,14 @@ def client_load_and_encrypt_model(model_id,device: Device = None):
 
     encrypted_weights = {}
     for name, param in plain_model.state_dict().items():
-        encrypted_weights[name] = crypten.cryptensor(param)
+        if "embedding" in name:
+            # 平文（torch.Tensor）のまま辞書に格納する！
+            encrypted_weights[name] = param.to(device)
+        else:
+            # それ以外は暗号化
+            encrypted_weights[name] = crypten.cryptensor(param).to(device)
     
-    mpc_model = Mamba2LMHeadModel(plain_model.args) 
+    mpc_model = Mamba2LMHeadModel(plain_model.args,device=device) 
     # 先ほど暗号化した重みを流し込む
     mpc_model.load_encrypted_state_dict(encrypted_weights)
 
@@ -69,7 +74,8 @@ def user_generate(
     prompt: str, 
     tokenizer, 
     generation_config: dict=generation_config, 
-    show_perf=True
+    show_perf=True,
+    device: Device = None
 ):
     """
     ユーザーの手元（クライアントサイド）で実行するメイン生成ループ関数。
@@ -83,7 +89,6 @@ def user_generate(
 
     start = time.process_time()
     n_generated = 0
-    h = None
 
     # 設定の読み込み
     max_new_length = generation_config.get("max_new_length", 20)
@@ -96,11 +101,22 @@ def user_generate(
     prefix = input_ids[:-1]
     
     h = None
+
     if prefix.shape[0] > 0:
+        MAX_LEN = 64 # 固定長
+        current_len = prefix.shape[0]
+        
+        if current_len < MAX_LEN:
+            pad_len = MAX_LEN - current_len
+            prefix = torch.nn.functional.pad(prefix, (pad_len, 0), value=0)
+            
+        # One-hot化して暗号化
+        prefix_onehot = torch.nn.functional.one_hot(prefix, num_classes=vocab_size).float().to(device)
+        prefix_onehot_mpc = crypten.cryptensor(prefix_onehot.unsqueeze(0)).to(device)
+
         # 残してある通常の forward 関数を呼び出し、プロンプト文脈を反映した初期キャッシュ h を作成する
-        # forward 内部で入力を受け取った直後に自動で crypten.cryptensor() に変換されます
         with torch.no_grad():
-            _, h = mpc_model(prefix.unsqueeze(0), None)
+            _, h = mpc_model(prefix_onehot_mpc,None)
     
     current_token_id = input_ids[-1].item()
 
@@ -110,7 +126,7 @@ def user_generate(
         # 現在のトークンIDを平文のOne-hot表現にし、暗号化（シェア化）してサーバーに送る形式にする
         onehot = torch.zeros(1, 1, vocab_size, device=device)
         onehot[0, 0, current_token_id] = 1.0
-        onehot_mpc = crypten.cryptensor(onehot)  # 暗号化
+        onehot_mpc = crypten.cryptensor(onehot).to(device)  # 暗号化
         
         # サーバーの秘密計算関数を呼び出し、次のロジット（シェア）とキャッシュを受け取る
         with torch.no_grad():
@@ -179,8 +195,8 @@ if __name__ == "__main__":
         device = torch.device('cpu')
 
     
-    model = client_load_and_encrypt_model("state-spaces/mamba2-1.3b", device=device)
+    model = client_load_and_encrypt_model("state-spaces/mamba2-130m", device=device)
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    user_generate(model,"Mamba-2 with MPC is",tokenizer)
+    user_generate(model,"Mamba-2 with MPC is",tokenizer,device=device)

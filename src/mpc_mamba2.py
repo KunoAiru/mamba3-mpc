@@ -29,7 +29,7 @@ class Mamba2Config:
     d_conv: int = 4  # convolution kernel size 直近でみるトークン数
     expand: int = 2  # expansion factor (E)
     headdim: int = 64  # head dimension (P)
-    chunk_size: int = 64  # matrix partition size (Q)
+    chunk_size: int = 64  # matrix partition size (Q) 
     vocab_size: int = 50277
     pad_vocab_size_multiple: int = 16
 
@@ -48,8 +48,8 @@ class Mamba2Config:
 
 #1トークンずつ推論する際のキャッシュ
 class InferenceCache(NamedTuple):
-    conv_state: Tensor  # (batch, d_inner + 2 * d_state, d_conv)
-    ssm_state: Tensor  # (batch, nheads, headdim, d_state)
+    conv_state: MPCTensor  # (batch, d_inner + 2 * d_state, d_conv)
+    ssm_state: MPCTensor  # (batch, nheads, headdim, d_state)
 
     @staticmethod
     def alloc(batch_size: int, args: Mamba2Config, device: Device = None):
@@ -112,7 +112,10 @@ class Mamba2LMHeadModel(nn.Module):
     
     def encrypt_lm_head(self):
         if self.lm_head_weight_crypt is None:
-            self.lm_head_weight_crypt = crypten.cryptensor(self.lm_head.weight)
+            if isinstance(self.lm_head.weight, crypten.mpc.MPCTensor):
+                self.lm_head_weight_crypt = self.lm_head.weight
+            else:
+                self.lm_head_weight_crypt = crypten.cryptensor(self.lm_head.weight).to(self.device)
     
     def load_encrypted_state_dict(self, encrypted_state_dict):
         """
@@ -125,34 +128,26 @@ class Mamba2LMHeadModel(nn.Module):
             for attr in attrs[:-1]:
                 submodule = getattr(submodule, attr)
             
+            if attrs[-1] in submodule._parameters:
+                del submodule._parameters[attrs[-1]]
+            if attrs[-1] in submodule._buffers:
+                del submodule._buffers[attrs[-1]]
+            
             setattr(submodule, attrs[-1], r_tensor)
 
     def forward(
-        self, input_ids: LongTensor, h: list[InferenceCache] | list[None] | None = None
-    ) -> tuple[LongTensor, list[InferenceCache]]:
-        """
-        Arguments
-            input_ids: (batch, seqlen) tokens from `EleutherAI/gpt-neox-20b` tokenizer
-            h: hidden states for inference step. If present the constant-time
-               (wrt sequence length) inference path will be taken, input_ids
-               should have shape (batch, 1) containing the next batch of prompt
-               token.
-
-        Return (logits, h)
-            logits: (batch, seqlen, vocab_size)
-            h: updated inference cache after processing `input_ids`
-        """
+        self, input_onehot_mpc: MPCTensor, h: list[InferenceCache] | list[None] | None = None
+    ) -> tuple[MPCTensor, list[InferenceCache]]:
 
         # 入力テキストが何トークンかを測る
-        seqlen = input_ids.shape[1]
+        seqlen = input_onehot_mpc.shape[1]
 
         # 1トークン目の場合（h_0の場合）、各レイヤーの隠れ状態をリセット
         if h is None:
             h = [None for _ in range(self.args.n_layer)]
 
         # 単語埋め込み処理
-        x = self.backbone.embedding(input_ids)
-        x = crypten.cryptensor(x)
+        x = input_onehot_mpc.matmul(self.backbone.embedding.weight) # (batch, seqlen, d_model)
 
         # 全レイヤーにおいてこの処理を繰り返す
         for i, layer in enumerate(self.backbone.layers):
@@ -173,86 +168,11 @@ class Mamba2LMHeadModel(nn.Module):
         # 入力トークン文の予測確率と記憶(キャッシュ)を保存
         return logits[:, :seqlen], cast(list[InferenceCache], h)
 
-    """
-    def generate(
-        self,
-        input_ids: LongTensor,
-        max_new_length: int = 20,
-        temperature: float = 1.0,
-        top_k: int = 50,
-        top_p: float = 1.0,
-        eos_token_id: int = 0,
-    ) -> Iterable[tuple[int, list[InferenceCache]]]:
-        
-        # prefix: 最後の1トークンを除く過去のトークンすべて
-        # tokens: 最後の1トークンだけ。これを「現在の入力」として、次の文字の予測を開始
-        prefix, tokens = input_ids[:-1], input_ids[-1:].unsqueeze(0)
-
-        # Process prompt
-        # The input sequence to forward (non-inference path) must have length multiple that of chunk_size.
-        # We split out excess tokens so that n_chunked tokens can be processed by one forward call and
-        # process the rest in multiple inference steps.
-
-        # チャンクサイズに分けて処理を行う
-        n_chunked = (prefix.shape[0] // self.args.chunk_size) * self.args.chunk_size
-
-        # チャンクで高速計算し、隠れ状態hを初期化
-        if n_chunked > 0:
-            _, h = self(prefix[:n_chunked].unsqueeze(0), None)
-
-        # チャンクから溢れたものは、hをゼロから立ち上げる
-        else:
-            h = [
-                InferenceCache.alloc(1, self.args, device=self.device)
-                for _ in range(self.args.n_layer)
-            ]
-        
-        # 一トークンずつ順番に処理
-        for i in range(n_chunked, prefix.shape[0]):
-            _, h = self(prefix[i : i + 1].unsqueeze(0), h)
-
-        # Generate
-        for _ in range(max_new_length):
-            with torch.no_grad():
-                out, h = self(tokens, h)
-            logits = out[0, -1]
-            #スコアを温度で割る
-            if temperature != 1.0:
-                logits = logits / temperature
-            # Top-Kフィルター
-            if top_k > 0:
-                #確率が高い順にK個だけ残す
-                indices_to_remove = logits < torch.topk(logits, k=top_k)[0][-1]
-                logits[indices_to_remove] = -torch.inf
-            # Top-Pフィルター
-            if top_p < 1.0:
-                #累積確率で上位top_pのしきい値に入らないトークンは切る
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cum_probs = MPCMamba_Function.cumsum(MPCMamba_Function.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cum_probs > 0.5
-                sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
-                sorted_indices_to_remove[0] = False
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                logits[indices_to_remove] = -torch.inf
-            # 確率分布計算
-            probs = MPCMamba_Function.softmax(logits, dim=-1)
-            # 確率分布を基に、次のトークンを予測
-            next_token = torch.multinomial(probs, num_samples=1)
-
-            # 最後のトークンなら終了
-            if next_token.item() == eos_token_id:
-                return
-            
-            # 作ったトークンを次の入力にセットし、決定したトークンIDと最新の隠れ状態hを呼び出し元へ送る
-            tokens = next_token.unsqueeze(0)
-
-            yield cast(int, next_token.item()), h
-    """
     def predict_next_logit_mpc(
         self, 
-        current_token_onehot: crypten.CrypTensor, 
+        current_token_onehot: MPCTensor, 
         h: list[InferenceCache] | list[None] | None = None
-    ) -> tuple[crypten.CrypTensor, list[InferenceCache]]:
+    ) -> tuple[MPCTensor, list[InferenceCache]]:
         """
         サーバー側で1トークン分の秘密計算を行い、次のロジットのシェアを返す。
         
@@ -264,8 +184,7 @@ class Mamba2LMHeadModel(nn.Module):
             h = [None for _ in range(self.args.n_layer)]
 
         # nn.Embeddingの代わりにOne-hot行列積で暗号化埋め込みベクトルを作る
-        emb_weight = crypten.cryptensor(self.backbone.embedding.weight)
-        x = current_token_onehot.matmul(emb_weight)  # (1, 1, d_model)
+        x = current_token_onehot.matmul(self.backbone.embedding.weight)  # (1, 1, d_model)
 
         # 全レイヤーでSSM処理を繰り返す (すべて暗号化空間)
         for i, layer in enumerate(self.backbone.layers):
@@ -332,17 +251,28 @@ class Mamba2(nn.Module):
     
     def encrypt_weights(self):
         if self.in_proj_weight_crypt is None:
-            self.in_proj_weight_crypt = crypten.cryptensor(self.in_proj.weight)
-            self.out_proj_weight_crypt = crypten.cryptensor(self.out_proj.weight)
-            self.dt_bias_crypt = crypten.cryptensor(self.dt_bias)
-            self.A_log_crypt = crypten.cryptensor(self.A_log)
-            self.D_crypt = crypten.cryptensor(self.D)
+            if isinstance(self.in_proj.weight, crypten.mpc.MPCTensor):
+                self.in_proj_weight_crypt = self.in_proj.weight
+                self.out_proj_weight_crypt = self.out_proj.weight
+                self.dt_bias_crypt = self.dt_bias
+                self.A_log_crypt = self.A_log
+                self.D_crypt = self.D
+            else:
+                self.in_proj_weight_crypt = crypten.cryptensor(self.in_proj.weight).to(self.device)
+                self.out_proj_weight_crypt = crypten.cryptensor(self.out_proj.weight).to(self.device)
+                self.dt_bias_crypt = crypten.cryptensor(self.dt_bias).to(self.device)
+                self.A_log_crypt = crypten.cryptensor(self.A_log).to(self.device)
+                self.D_crypt = self.D
         
         if self.conv1d_weight_crypt is None:
-            self.conv1d_weight_crypt = crypten.cryptensor(self.conv1d.weight)
-            self.conv1d_bias_crypt = crypten.cryptensor(self.conv1d.bias)
+            if isinstance(self.conv1d.weight, crypten.mpc.MPCTensor):
+                self.conv1d_weight_crypt = self.conv1d.weight
+                self.conv1d_bias_crypt = self.conv1d.bias
+            else:
+                self.conv1d_weight_crypt = crypten.cryptensor(self.conv1d.weight).to(self.device)
+                self.conv1d_bias_crypt = crypten.cryptensor(self.conv1d.bias).to(self.device)
     
-    def causal_conv1d(self, x: Tensor) -> Tensor:
+    def causal_conv1d(self, x: MPCTensor) -> MPCTensor:
         """CrypTen（MPC）環境で動作する1D畳み込み
         
         Arguments:
@@ -361,11 +291,11 @@ class Mamba2(nn.Module):
         
         # 1. 因果性（Causal）を担保するため、時系列の「前側（左側）」にだけパディングを行う
         pad_left = k_size - 1
-        zeros_pad = crypten.zeros(batch, conv_dim, pad_left, device=self.device)
+        zeros_pad = crypten.cryptensor(torch.zeros(batch, conv_dim, pad_left, device=self.device)).to(self.device)
         x_padded = crypten.cat([zeros_pad, x_t], dim=-1) # (batch, conv_dim, pad_left + seqlen)
         
         # 出力用のバッファを0で初期化
-        conv_out = crypten.zeros(batch, conv_dim, seqlen, device=self.device)
+        conv_out = crypten.cryptensor(torch.zeros(batch, conv_dim, seqlen, device=self.device)).to(self.device)
         
         # 2. カーネルサイズ分（Mamba2の標準設定では4回）のループで畳み込みを計算
         # 各カーネル位置の重みを、時間軸をずらした入力スライスに対して要素ごとに掛け算して足し合わせる
@@ -385,7 +315,7 @@ class Mamba2(nn.Module):
         # 形状を元に戻す (batch, conv_dim, seqlen) -> (batch, seqlen, conv_dim)
         return conv_out.transpose(1, 2)
 
-    def forward(self, u: Tensor, h: InferenceCache | None = None):
+    def forward(self, u: MPCTensor, h: InferenceCache | None = None):
         """
         Arguments
             u: (batch, seqlen, d_model) input. seqlen should be a multiple of chunk_size.
@@ -473,7 +403,7 @@ class Mamba2(nn.Module):
         return y, h
 
     # 直前の隠れ状態hだけを更新して、1トークンを素早く生成する関数
-    def step(self, u: Tensor, h: InferenceCache) -> tuple[Tensor, InferenceCache]:
+    def step(self, u: MPCTensor, h: InferenceCache) -> tuple[MPCTensor, InferenceCache]:
         """Take a single inference step for the current input and hidden state
 
         Unlike attention-based models, RNN-based models (eg Mamba) does not need
@@ -574,7 +504,7 @@ class Mamba2(nn.Module):
         return y.unsqueeze(1), h
     
     # Mamba2(SSD)の処理
-    def ssd(self,x, A, B, C,initial_states=None):
+    def ssd(self, x: MPCTensor, A: MPCTensor, B: MPCTensor, C: MPCTensor, initial_states: MPCTensor | None = None) -> tuple[MPCTensor, MPCTensor]:
         """Structed State Space Duality (SSD) - the core of Mamba-2
 
         This is almost the exact same minimal SSD code from the blog post.
@@ -608,7 +538,8 @@ class Mamba2(nn.Module):
         batch_size = x.shape[0]
         num_chunks = x.shape[1] // self.args.chunk_size
         x = x.reshape(batch_size, num_chunks, self.args.chunk_size, self.args.nheads, self.args.headdim)
-        A = A.reshape(batch_size, self.args.headdim, num_chunks, self.args.chunk_size)
+        A = A.reshape(batch_size, num_chunks, self.args.chunk_size, self.args.nheads)
+        A = A.permute(0, 3, 1, 2)
         B = B.reshape(batch_size, num_chunks, self.args.chunk_size, self.args.d_state)
         C = C.reshape(batch_size, num_chunks, self.args.chunk_size, self.args.d_state)
 
@@ -626,9 +557,18 @@ class Mamba2(nn.Module):
         # L: (b, h, c, l, s) -> (b, c, l, s, h, 1, 1)
         # x: (b, c, s, h, p) -> (b, c, 1, s, h, p, 1)
         L_perm = L.permute(0, 2, 3, 4, 1)
-        Y_diag_5d = (
-            C.unsqueeze(3).unsqueeze(4).unsqueeze(5) * B.unsqueeze(2).unsqueeze(4).unsqueeze(5) * L_perm.unsqueeze(-1).unsqueeze(-1) * x.unsqueeze(2).unsqueeze(-1)
-        )
+
+        # 各テンソルの本来の形状を取得
+        shape_C = C.shape
+        shape_B = B.shape
+        shape_L = L_perm.shape
+        shape_x = x.shape
+        C_5d = C.view(*shape_C, 1, 1, 1, 1)  # 必要な位置に1を配置
+        B_5d = B.view(shape_B[0], shape_B[1], 1, shape_B[2], 1, 1, 1)  # 元のコードのunsqueeze位置に対応
+        L_5d = L_perm.view(*shape_L, 1, 1)
+        x_5d = x.view(shape_x[0], shape_x[1], 1, 1, shape_x[2], 1, 1)
+        # 4つのテンソルを一度に掛けることで、中間テンソルの生成を最小限に抑えます
+        Y_diag_5d = C_5d * B_5d * L_5d * x_5d
         Y_diag = Y_diag_5d.sum(dim=-1).sum(dim=3) # 結果: (b, c, l, h, p)
 
 
@@ -652,8 +592,9 @@ class Mamba2(nn.Module):
         # (middle term of factorization of off-diag blocks; A terms)
         # 過去の履歴がない場合は初期化
         if initial_states is None:
-            initial_states = torch.zeros_like(states[:, :1])
-            crypt_initial_states = crypten.cryptensor(initial_states)
+            crypt_initial_states = crypten.cryptensor(torch.zeros(batch_size, 1, self.args.nheads, self.args.headdim, self.args.d_state, device=self.device)).to(self.device)
+        else:
+            crypt_initial_states = initial_states
         states = crypten.cat([crypt_initial_states, states], dim=1)
 
         # チャンクをまたぐ時の減衰
@@ -694,7 +635,7 @@ class Mamba2(nn.Module):
         return Y, final_state
 
 # 「過去から現在にいたるまで、記憶がどれくらい連続して減衰（忘却）してきたか」の累積合計を、巨大な行列として一発で計算するための下請け関数
-def segsum(x: Tensor, device: Device = None) -> Tensor:
+def segsum(x: MPCTensor, device: Device = None) -> MPCTensor:
     """Stable segment sum calculation.
 
     `exp(segsum(A))` produces a 1-semiseparable matrix, which is equivalent to a scalar SSM.
@@ -712,7 +653,7 @@ def segsum(x: Tensor, device: Device = None) -> Tensor:
     # mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=-1)
     # x = x.masked_fill(~mask, 0)
     tril_mask_minus1 = torch.tril(torch.ones(T, T, device=device), diagonal=-1)
-    x = x * crypten.cryptensor(tril_mask_minus1)
+    x = x * crypten.cryptensor(tril_mask_minus1).to(device)
 
     # 行列の縦方向（dim=-2）に向かって、数値を上から下へと累積足し算（累積和）
     x_segsum = MPCMamba_Function.cumsum(x, dim=-2)
@@ -722,7 +663,7 @@ def segsum(x: Tensor, device: Device = None) -> Tensor:
     # x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
     triu_mask_0 = torch.triu(torch.ones(T, T, device=device), diagonal=1)
     keep_mask = 1 - triu_mask_0
-    x_segsum = x_segsum * crypten.cryptensor(keep_mask) + crypten.cryptensor(triu_mask_0) * (-10000.0)
+    x_segsum = x_segsum * crypten.cryptensor(keep_mask).to(device) + crypten.cryptensor(triu_mask_0).to(device) * (-10000.0)
 
     # 累積減衰行列を返す
     return x_segsum
@@ -738,7 +679,8 @@ class RMSNorm(nn.Module):
         if z is not None:
             x = x * MPCMamba_Function.silu(z)
         
-        return x * MPCMamba_Function.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+        var = (x * x).sum(dim=-1, keepdim=True) / x.shape[-1]
+        return x * MPCMamba_Function.rsqrt(var + self.eps) * self.weight
 
 class MPCMamba_Function():
     @staticmethod
@@ -777,7 +719,7 @@ class MPCMamba_Function():
             return x
         shape = list(x.shape)
         shape[-1] = pad_size
-        zeros = crypten.zeros(*shape, device=x.device)
+        zeros = crypten.cryptensor(torch.zeros(*shape, device=x.device)).to(x.device)
         return crypten.cat([zeros, x], dim=-1)
     
     @staticmethod
@@ -793,12 +735,18 @@ class MPCMamba_Function():
         
         # Tのサイズを持つ「1」で満たされた平文テンソルを掛けてブロードキャストさせる
         ones = torch.ones([1] * (len(x.shape)) + [T], device=x.device)
-        ones = crypten.cryptensor(ones)
+        ones = crypten.cryptensor(ones).to(x.device)
         return x_expanded * ones
     
     @staticmethod
     def cumsum(x, dim):
-        res = [x.select(dim, 0)]
-        for i in range(1, x.size(dim)):
-            res.append(res[-1] + x.select(dim, i))
+        def mpc_select(tensor, d, idx):
+            slices = [slice(None)] * len(tensor.shape)
+            slices[d] = idx
+            return tensor[tuple(slices)]
+
+        res = [mpc_select(x, dim, 0)]
+        for i in range(1, x.shape[dim]):
+            res.append(res[-1] + mpc_select(x, dim, i))
+            
         return crypten.stack(res, dim=dim)
