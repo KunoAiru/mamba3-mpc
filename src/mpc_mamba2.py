@@ -88,7 +88,7 @@ class Mamba2LMHeadModel(nn.Module):
                                 # 状態空間モデル(SSM)
                                 mixer=Mamba2(args, device=device),
                                 # RMSNormによる層正規化
-                                norm=RMSNorm(args.d_model, device=device),
+                                norm=RMSNorm(args.d_model,debug=1,device=device),
                             )
                         )
                         for _ in range(args.n_layer)
@@ -96,7 +96,7 @@ class Mamba2LMHeadModel(nn.Module):
                 ),
 
                 # 最後に最終的な層正規化を行う
-                norm_f=RMSNorm(args.d_model, device=device),
+                norm_f=RMSNorm(args.d_model,debug=3, device=device),
             )
         )
 
@@ -237,7 +237,7 @@ class Mamba2(nn.Module):
         self.D = nn.Parameter(torch.empty(args.nheads, device=device))
 
         # 正規化
-        self.norm = RMSNorm(args.d_inner, device=device)
+        self.norm = RMSNorm(args.d_inner,debug=2, device=device)
         # d_inner次元からd_model次元へ変換
         self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=False, device=device)
 
@@ -339,10 +339,11 @@ class Mamba2(nn.Module):
             return self.step(u, h)
 
         # 対数から負の実数に戻す
-        A = -MPCMamba_Function.exp(self.A_log_crypt)  # (nheads,)
+        A = -MPCMamba_Function.exp(self.A_log_crypt,debug=1)  # (nheads,)
 
         # 次元拡張を行う
         zxbcdt = u.matmul(self.in_proj_weight_crypt.t()) # (batch, seqlen, d_in_proj)
+        print(f"zxbcdt max_val : {zxbcdt.get_plain_text().max().item()}")
         
         #巨大化したデータを、ゲート用の z、メインデータの xBC、タイムステップ（時間の進み幅）の dt の3つに切り分け
         #z, xBC, dt = torch.split(zxbcdt,[self.args.d_inner,self.args.d_inner + 2 * self.args.d_state,self.args.nheads,],dim=-1,)
@@ -352,13 +353,21 @@ class Mamba2(nn.Module):
         xBC = zxbcdt[..., idx1:idx2]
         dt = zxbcdt[..., idx2:]
 
+        #print(f"dt max_val : {dt.get_plain_text().max().item()}")
+        #print(f"xBC max_val : {xBC.get_plain_text().max().item()}")
+        #print(f"z max_val : {z.get_plain_text().max().item()}")
+
         # 活性化関数に通す
         dt = MPCMamba_Function.softplus(dt + self.dt_bias_crypt)  # (batch, seqlen, nheads)
+        #print(f"dt max_val after softplus: {dt.get_plain_text().max().item()}")
 
         # 将来の1文字生成（step）のために、現在の状態を記録（パディング処理）
         # xBC = (b l d -> b d l)
         xBC_t = xBC.transpose(1, 2)
-        conv_state = MPCMamba_Function.pad_left(xBC_t,self.args.d_conv - u.shape[1])
+        if u.shape[1] >= self.args.d_conv:
+            conv_state = xBC_t[..., -self.args.d_conv:]
+        else:
+            conv_state = MPCMamba_Function.pad_left(xBC_t, self.args.d_conv - u.shape[1])
         # 1次元畳み込みを実行し、SiLUで活性化
         xBC = self.causal_conv1d(xBC)
         xBC = MPCMamba_Function.silu(xBC) # (batch, seqlen, d_inner + 2 * d_state)
@@ -371,7 +380,6 @@ class Mamba2(nn.Module):
         x = xBC[..., :idx1]
         B = xBC[..., idx1:idx2]
         C = xBC[..., idx2:]
-
 
         # x = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
         batch, seqlen, d_inner = x.shape[0], x.shape[1], x.shape[2]
@@ -437,11 +445,9 @@ class Mamba2(nn.Module):
         # 隠れ状態4トークン分に対して、左に1つずらす（一番古いトークンを捨てる）
         # h.conv_state.copy_(torch.roll(h.conv_state, shifts=-1, dims=-1))
         shifted = h.conv_state[:, :, 1:]
-
-        # 空いた一番右端（最新の位置）に、今入ってきた新入りトークン（xBC）を滑り込ませる
+        new_conv_state = crypten.cat([shifted, xBC.unsqueeze(-1)], dim=-1)
         #h.conv_state[:, :, -1] = xBC
-        h.conv_state = crypten.cat([shifted, xBC.unsqueeze(-1)], dim=-1)
-        
+        h = InferenceCache(new_conv_state, h.ssm_state)
 
         # 直近4トークン分に対して、畳み込み計算（掛け算と足し算）を行う
         #xBC = torch.sum(h.conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)
@@ -460,12 +466,11 @@ class Mamba2(nn.Module):
         x = xBC[..., :idx1]
         B = xBC[..., idx1:idx2]
         C = xBC[..., idx2:]
-
-        A = -MPCMamba_Function.exp(self.A_log_crypt)  # (nheads,)
+        A = -MPCMamba_Function.exp(self.A_log_crypt,debug=2)  # (nheads,)
 
         # SSMの更新式
         dt = MPCMamba_Function.softplus(dt + self.dt_bias_crypt)  # (batch, nheads)
-        dA = MPCMamba_Function.exp(dt * A)  # (batch, nheads)
+        dA = MPCMamba_Function.exp(dt * A,debug=3)  # (batch, nheads)
         # x = rearrange(x, "b (h p) -> b h p", p=self.args.headdim)
         batch,d_inner = x.shape[0],x.shape[1]
         nheads = d_inner // self.args.headdim
@@ -480,7 +485,8 @@ class Mamba2(nn.Module):
 
         # h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
         dA_4d = dA.unsqueeze(-1).unsqueeze(-1)
-        h.ssm_state = h.ssm_state * dA_4d + dBx
+        new_ssm_state = h.ssm_state * dA_4d + dBx
+        h = InferenceCache(h.conv_state, new_ssm_state)
 
         # y = torch.einsum("bhpn, bn -> bhp", h.ssm_state, C)
         # C: (batch, d_state) -> (batch, 1, 1, d_state)
@@ -548,7 +554,10 @@ class Mamba2(nn.Module):
 
         # 1. Compute the output for each intra-chunk (diagonal blocks)
         # Y =(L⊙CB)X
-        L = MPCMamba_Function.exp(segsum(A, device=self.device))
+        L = MPCMamba_Function.exp(segsum(A, device=self.device),debug=4)
+        triu_mask_0 = torch.triu(torch.ones(self.args.chunk_size, self.args.chunk_size, device=self.device), diagonal=1)
+        keep_mask = 1 - triu_mask_0
+        L = L * crypten.cryptensor(keep_mask).to(self.device)
 
         #Y_diag = torch.einsum("bclhn, bcshn, bhcls, bcshp -> bclhp", C, B, L, x)
         # ターゲット形状: (b, c, l, s, h, p, n) になるように拡張
@@ -558,24 +567,29 @@ class Mamba2(nn.Module):
         # x: (b, c, s, h, p) -> (b, c, 1, s, h, p, 1)
         L_perm = L.permute(0, 2, 3, 4, 1)
 
-        # 各テンソルの本来の形状を取得
-        shape_C = C.shape
-        shape_B = B.shape
-        shape_L = L_perm.shape
-        shape_x = x.shape
-        C_5d = C.view(*shape_C, 1, 1, 1, 1)  # 必要な位置に1を配置
-        B_5d = B.view(shape_B[0], shape_B[1], 1, shape_B[2], 1, 1, 1)  # 元のコードのunsqueeze位置に対応
-        L_5d = L_perm.view(*shape_L, 1, 1)
-        x_5d = x.view(shape_x[0], shape_x[1], 1, 1, shape_x[2], 1, 1)
-        # 4つのテンソルを一度に掛けることで、中間テンソルの生成を最小限に抑えます
-        Y_diag_5d = C_5d * B_5d * L_5d * x_5d
-        Y_diag = Y_diag_5d.sum(dim=-1).sum(dim=3) # 結果: (b, c, l, h, p)
+        # 各テンソルの元の形状
+        # C: (b, c, l, n)
+        # B: (b, c, s, n)
+        # L_perm: (b, c, l, s, h)
+        # x: (b, c, s, h, p)
 
+        # (b, c, l, 1, n) * (b, c, 1, s, n) -> (b, c, l, s, n) -> sum(-1) -> (b, c, l, s)
+        C_expanded = C.unsqueeze(3) # (b, c, l, 1, n)
+        B_expanded = B.unsqueeze(2) # (b, c, 1, s, n)
+        CB = (C_expanded * B_expanded).sum(dim=-1) # (b, c, l, s)
+
+        # (b, c, l, s, 1) * (b, c, l, s, h) -> (b, c, l, s, h)
+        CBL = CB.unsqueeze(-1) * L_perm # (b, c, l, s, h)
+        # CBL (b, c, l, s, h, 1) * x (b, c, 1, s, h, p) -> sum(dim=3) -> (b, c, l, h, p)
+        CBL_expanded = CBL.unsqueeze(-1) # (b, c, l, s, h, 1)
+        x_expanded = x.unsqueeze(2)      # (b, c, 1, s, h, p)
+        
+        Y_diag = (CBL_expanded * x_expanded).sum(dim=3) # (b, c, l, h, p)
 
         # 2. Compute the state for each intra-chunk
         # (right term of low-rank factorization of off-diagonal blocks; B terms)
         # チャンク内の各単語の記憶が、チャンクの境界線に到達した時にどれくらい弱まっているか（引き継ぎ用の減衰率）を計算
-        decay_states = MPCMamba_Function.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
+        decay_states = MPCMamba_Function.exp(A_cumsum[:, :, :, -1:] - A_cumsum,debug=5)
 
         #states = torch.einsum("bclhn, bhcl, bclhp -> bchpn", B, decay_states, x)
         # ターゲット形状: (b, c, l, h, p, n)
@@ -598,7 +612,11 @@ class Mamba2(nn.Module):
         states = crypten.cat([crypt_initial_states, states], dim=1)
 
         # チャンクをまたぐ時の減衰
-        decay_chunk = MPCMamba_Function.exp(segsum(MPCMamba_Function.pad_left(A_cumsum[:, :, :, -1], 1), device=self.device))
+        decay_chunk = MPCMamba_Function.exp(segsum(MPCMamba_Function.pad_left(A_cumsum[:, :, :, -1], 1), device=self.device),debug=6)
+        num_chunks_plus1 = decay_chunk.size(-1)
+        triu_mask_c = torch.triu(torch.ones(num_chunks_plus1, num_chunks_plus1, device=self.device), diagonal=1)
+        keep_mask_c = 1 - triu_mask_c
+        decay_chunk = decay_chunk * crypten.cryptensor(keep_mask_c).to(self.device)
 
         #new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
         decay_chunk_exp = decay_chunk.unsqueeze(-1).unsqueeze(-1) # (b, h, z, c, 1, 1)
@@ -614,7 +632,7 @@ class Mamba2(nn.Module):
         # 4. Compute state -> output conversion per chunk
         # (left term of low-rank factorization of off-diagonal blocks; C terms)
         # 前のチャンクから引き継いだ記憶を、各チャンク内の64文字の単語たちに分配して、フェーズ1の結果と足し算
-        state_decay_out = MPCMamba_Function.exp(A_cumsum)
+        state_decay_out = MPCMamba_Function.exp(A_cumsum,debug=7)
 
         #Y_off = torch.einsum("bclhn, bchpn, bhcl -> bclhp", C, states, state_decay_out)
         # ターゲット形状: (b, c, l, h, p, n)
@@ -622,10 +640,10 @@ class Mamba2(nn.Module):
         # states:          (b, c, h, p, n) -> (b, c, 1, h, p, n)
         # state_decay_out: (b, h, c, l) -> (b, c, l, h, 1, 1)
         state_decay_out_perm = state_decay_out.permute(0, 2, 3, 1)
-        Y_off_6d = (
-            C.unsqueeze(3).unsqueeze(4) * states.unsqueeze(2) * state_decay_out.unsqueeze(4).unsqueeze(-1)
-        )
-        Y_off = Y_off_6d.sum(dim=-1)
+        C_exp = C.unsqueeze(3).unsqueeze(4)       # (b, c, l, 1, 1, n)
+        states_exp = states.unsqueeze(2)           # (b, c, 1, h, p, n)
+        C_states = (C_exp * states_exp).sum(dim=-1) # (b, c, l, h, p)
+        Y_off = C_states * state_decay_out_perm.unsqueeze(-1)
 
         # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
         #Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
@@ -663,28 +681,42 @@ def segsum(x: MPCTensor, device: Device = None) -> MPCTensor:
     # x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
     triu_mask_0 = torch.triu(torch.ones(T, T, device=device), diagonal=1)
     keep_mask = 1 - triu_mask_0
-    x_segsum = x_segsum * crypten.cryptensor(keep_mask).to(device) + crypten.cryptensor(triu_mask_0).to(device) * (-10000.0)
+    x_segsum = x_segsum * crypten.cryptensor(keep_mask).to(device)
 
     # 累積減衰行列を返す
     return x_segsum
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, d: int, eps: float = 1e-5, device: Device = None):
+    def __init__(self, d: int, debug: int, eps: float = 1e-5, device: Device = None):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(d, device=device))
+        self.debug = debug
 
     def forward(self, x, z=None):
         if z is not None:
             x = x * MPCMamba_Function.silu(z)
         
         var = (x * x).sum(dim=-1, keepdim=True) / x.shape[-1]
+        #print(f"RMSNorm dubug ID:{self.debug}")
+        #print("var:", var.get_plain_text().abs().max().item())
+        #print("x:", x.get_plain_text().abs().max().item())
+        #print("result:", (x * MPCMamba_Function.rsqrt(var + self.eps) * self.weight).get_plain_text().abs().max().item())
+        var = MPCMamba_Function.clamp(var, min_val=1.0,max_val=4096.0)
+        u = var / 1024.0
+
         return x * MPCMamba_Function.rsqrt(var + self.eps) * self.weight
 
 class MPCMamba_Function():
     @staticmethod
-    def exp(x : MPCTensor) -> MPCTensor:
+    def exp(x : MPCTensor,debug: int) -> MPCTensor:
+        #max_val = x.get_plain_text().max().item()
+        #min_val = x.get_plain_text().min().item()
+        #print(f"exp dubug ID:{debug}")
+        #print(f"exp input max: {max_val}")   
+        #print(f"exp input min: {min_val}")
+        x = MPCMamba_Function.clamp(x,min_val=-500.0,max_val = 10.0)   
         return x.exp()
 
     @staticmethod
@@ -697,15 +729,30 @@ class MPCMamba_Function():
 
     @staticmethod
     def rsqrt(x : MPCTensor) -> MPCTensor:
+        max_val = x.get_plain_text().max().item()
+        print(f"rsqrt input max: {max_val}")   
+        x = MPCMamba_Function.clamp(x,max_val = 165.0)
         return x.inv_sqrt()
     
     @staticmethod
     def silu(x : MPCTensor) -> MPCTensor:
+        #x = MPCMamba_Function.clamp(x,max_val = 500.0)
         return x * x.sigmoid()
     
     @staticmethod
     def softplus(x : MPCTensor) -> MPCTensor:
-        return (x.exp() + 1.0).log()
+        x = MPCMamba_Function.clamp(x, max_val=5.5)
+        result =  (x.exp() + 1.0).log()
+        return result
+    
+    @staticmethod
+    def clamp(x: crypten.mpc.MPCTensor, max_val=None, min_val=None):
+        res = x
+        if max_val is not None:
+            res = max_val - (max_val - res).relu()
+        if min_val is not None:
+            res = min_val + (res - min_val).relu()          
+        return res
     
     @staticmethod
     def pad_left(x, pad_size):

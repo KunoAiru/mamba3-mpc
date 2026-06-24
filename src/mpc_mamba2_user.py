@@ -5,6 +5,8 @@ import json
 from typing import TypeAlias
 from mpc_mamba2 import Mamba2LMHeadModel,Mamba2Config
 from transformers import AutoTokenizer
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="crypten")
 
 Device: TypeAlias = str | torch.device | None
 
@@ -199,4 +201,4 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    user_generate(model,"Mamba-2 with MPC is",tokenizer,device=device)
+    user_generate(model,"Japan is \n",tokenizer,device=device)
