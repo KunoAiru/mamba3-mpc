@@ -3,12 +3,14 @@ import crypten
 import time
 import json
 from typing import TypeAlias
-from mpc_mamba2 import Mamba2LMHeadModel,Mamba2Config
+from mpc_mamba2 import Mamba2LMHeadModel,Mamba2Config,InferenceCache
 from transformers import AutoTokenizer
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="crypten")
 
 Device: TypeAlias = str | torch.device | None
+
+DEBUG_TOKEN_TOP10 = True
 
 generation_config = dict(
     max_new_length=200,
@@ -71,6 +73,18 @@ def client_load_and_encrypt_model(model_id,device: Device = None):
         
     return mpc_model
 
+def make_onehot_mpc(token_id: int, vocab_size: int, device):
+    onehot = torch.zeros(1, 1, vocab_size, device=device)
+    onehot[0, 0, int(token_id)] = 1.0
+    return crypten.cryptensor(onehot).to(device)
+
+def print_topk_logits(name, logits, tokenizer, k=10):
+    if DEBUG_TOKEN_TOP10:
+        vals, ids = torch.topk(logits.float(), k)
+        print(f"\n{name} top-{k}")
+        for rank, (v, idx) in enumerate(zip(vals.tolist(), ids.tolist()), 1):
+            print(rank, idx, repr(tokenizer.decode([idx])), v)
+
 def user_generate(
     mpc_model: Mamba2LMHeadModel, 
     prompt: str, 
@@ -101,26 +115,30 @@ def user_generate(
 
     # 最初のトークンIDをセット（プロンプトの最後のトークン）
     prefix = input_ids[:-1]
-    
-    h = None
+    chunk_size = mpc_model.args.chunk_size
+    n_chunked = (prefix.shape[0] // chunk_size) * chunk_size
 
-    if prefix.shape[0] > 0:
-        MAX_LEN = 64 # 固定長
-        current_len = prefix.shape[0]
-        
-        if current_len < MAX_LEN:
-            pad_len = MAX_LEN - current_len
-            prefix = torch.nn.functional.pad(prefix, (pad_len, 0), value=0)
-            
-        # One-hot化して暗号化
-        prefix_onehot = torch.nn.functional.one_hot(prefix, num_classes=vocab_size).float().to(device)
+    if n_chunked > 0:
+        prefix_chunk = prefix[:n_chunked]
+        prefix_onehot = torch.nn.functional.one_hot(prefix_chunk, num_classes=vocab_size).float().to(device)
         prefix_onehot_mpc = crypten.cryptensor(prefix_onehot.unsqueeze(0)).to(device)
 
-        # 残してある通常の forward 関数を呼び出し、プロンプト文脈を反映した初期キャッシュ h を作成する
         with torch.no_grad():
-            _, h = mpc_model(prefix_onehot_mpc,None)
-    
+            _, h = mpc_model(prefix_onehot_mpc, None)
+    else:
+        h = [
+            InferenceCache.alloc(1, mpc_model.args, device=device)
+            for _ in range(mpc_model.args.n_layer)
+        ]
+
+    with torch.no_grad():
+        for token_id in prefix[n_chunked:]:
+            token_mpc = make_onehot_mpc(token_id.item(), vocab_size, device)
+            _, h = mpc_model.predict_next_logit_mpc(token_mpc, h)
+
     current_token_id = input_ids[-1].item()
+
+    
 
     # 生成ループの開始
     for i in range(max_new_length):
@@ -135,8 +153,10 @@ def user_generate(
             logits_mpc, h = mpc_model.predict_next_logit_mpc(onehot_mpc, h)
             
         # サーバーから返ってきた「ロジットのシェア」をユーザーの手元だけで復号する
-        # これにより logits_plain は (vocab_size,) の普通のPyTorchテンソル（平文）になる
+        # logits_plain は (vocab_size,) の普通のPyTorchテンソル（平文）になる
         logits_plain = logits_mpc.get_plain_text().squeeze(0).squeeze(0)
+        if i < 5:
+            print_topk_logits(f"MPC step {i}", logits_plain, tokenizer, k=10)
 
         # 「平文」の処理
         if temperature != 1.0:
@@ -159,7 +179,7 @@ def user_generate(
             
         # 次のトークンを確率分布からサンプリング
         probs = torch.softmax(logits_plain, dim=-1)
-        next_token_tensor = torch.multinomial(probs, num_samples=1)
+        next_token_tensor = torch.argmax(logits_plain, dim=-1, keepdim=True) # next_token_tensor = torch.multinomial(probs, num_samples=1)
         current_token_id = next_token_tensor.item()
 
         # 終了トークンならループを抜ける
@@ -201,4 +221,4 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    user_generate(model,"Japan is \n",tokenizer,device=device)
+    user_generate(model,"Japan is ",tokenizer,device=device)

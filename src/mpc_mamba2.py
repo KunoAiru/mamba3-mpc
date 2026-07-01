@@ -20,6 +20,38 @@ from torch import LongTensor, Tensor, nn
 
 Device: TypeAlias = str | torch.device | None
 
+DEBUG_MPC = False
+DEBUG_PLAIN_RMSNORM = True
+
+def dbg(name, t, limit=1e4, layer_id=None):
+    if not DEBUG_MPC:
+        return
+
+    # MPCTensor の場合だけ復号
+    if hasattr(t, "get_plain_text"):
+        p = t.get_plain_text()
+    else:
+        p = t
+
+    tag = f"[layer {layer_id}] {name}" if layer_id is not None else name
+
+    max_v = p.max().item()
+    min_v = p.min().item()
+    absmax_v = p.abs().max().item()
+
+    print(
+        tag,
+        "shape", tuple(p.shape),
+        "max", max_v,
+        "min", min_v,
+        "absmax", absmax_v,
+        "nan", torch.isnan(p).any().item(),
+        "inf", torch.isinf(p).any().item(),
+    )
+
+    if torch.isnan(p).any() or torch.isinf(p).any() or absmax_v > limit:
+        raise RuntimeError(f"{tag} exploded")
+
 
 @dataclass
 class Mamba2Config:
@@ -86,17 +118,17 @@ class Mamba2LMHeadModel(nn.Module):
                         nn.ModuleDict(
                             dict(
                                 # 状態空間モデル(SSM)
-                                mixer=Mamba2(args, device=device),
+                                mixer=Mamba2(args, device=device,  layer_id=i),
                                 # RMSNormによる層正規化
-                                norm=RMSNorm(args.d_model,debug=1,device=device),
+                                norm=RMSNorm(args.d_model,S=8.0,device=device),
                             )
                         )
-                        for _ in range(args.n_layer)
+                        for i in range(args.n_layer)
                     ]
                 ),
 
                 # 最後に最終的な層正規化を行う
-                norm_f=RMSNorm(args.d_model,debug=3, device=device),
+                norm_f=RMSNorm(args.d_model,S=8.0, device=device),
             )
         )
 
@@ -188,25 +220,23 @@ class Mamba2LMHeadModel(nn.Module):
 
         # 全レイヤーでSSM処理を繰り返す (すべて暗号化空間)
         for i, layer in enumerate(self.backbone.layers):
-            y, h[i] = layer.mixer(layer.norm(x), h[i])
+            x_norm = layer.norm(x)
+            y, h[i] = layer.mixer(x_norm, h[i])
             x = y + x
 
         # 最終正規化
         x = self.backbone.norm_f(x)
-
-        # 出力ロジットの計算
         self.encrypt_lm_head()
-        logits = x.matmul(self.lm_head_weight_crypt.t())  # (1, 1, vocab_size)
-
-        # 暗号化されたロジットと、更新されたキャッシュを返す
+        logits = x.matmul(self.lm_head_weight_crypt.t())
         return logits, h
 
 
 class Mamba2(nn.Module):
-    def __init__(self, args: Mamba2Config, device: Device = None):
+    def __init__(self, args: Mamba2Config, device: Device = None, layer_id: int | None = None):
         super().__init__()
         self.args = args
         self.device = device
+        self.layer_id = layer_id
 
         # z, x, B, C, dtが格納されたベクトル
         # z: ゲート（フィルター）用のデータ
@@ -237,7 +267,7 @@ class Mamba2(nn.Module):
         self.D = nn.Parameter(torch.empty(args.nheads, device=device))
 
         # 正規化
-        self.norm = RMSNorm(args.d_inner,debug=2, device=device)
+        self.norm = RMSNorm(args.d_inner,S=32.0, device=device)
         # d_inner次元からd_model次元へ変換
         self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=False, device=device)
 
@@ -262,7 +292,7 @@ class Mamba2(nn.Module):
                 self.out_proj_weight_crypt = crypten.cryptensor(self.out_proj.weight).to(self.device)
                 self.dt_bias_crypt = crypten.cryptensor(self.dt_bias).to(self.device)
                 self.A_log_crypt = crypten.cryptensor(self.A_log).to(self.device)
-                self.D_crypt = self.D
+                self.D_crypt = crypten.cryptensor(self.D).to(self.device)
         
         if self.conv1d_weight_crypt is None:
             if isinstance(self.conv1d.weight, crypten.mpc.MPCTensor):
@@ -339,11 +369,10 @@ class Mamba2(nn.Module):
             return self.step(u, h)
 
         # 対数から負の実数に戻す
-        A = -MPCMamba_Function.exp(self.A_log_crypt,debug=1)  # (nheads,)
+        A = -MPCMamba_Function.exp(self.A_log_crypt)  # (nheads,)
 
         # 次元拡張を行う
         zxbcdt = u.matmul(self.in_proj_weight_crypt.t()) # (batch, seqlen, d_in_proj)
-        print(f"zxbcdt max_val : {zxbcdt.get_plain_text().max().item()}")
         
         #巨大化したデータを、ゲート用の z、メインデータの xBC、タイムステップ（時間の進み幅）の dt の3つに切り分け
         #z, xBC, dt = torch.split(zxbcdt,[self.args.d_inner,self.args.d_inner + 2 * self.args.d_state,self.args.nheads,],dim=-1,)
@@ -353,13 +382,8 @@ class Mamba2(nn.Module):
         xBC = zxbcdt[..., idx1:idx2]
         dt = zxbcdt[..., idx2:]
 
-        #print(f"dt max_val : {dt.get_plain_text().max().item()}")
-        #print(f"xBC max_val : {xBC.get_plain_text().max().item()}")
-        #print(f"z max_val : {z.get_plain_text().max().item()}")
-
         # 活性化関数に通す
         dt = MPCMamba_Function.softplus(dt + self.dt_bias_crypt)  # (batch, seqlen, nheads)
-        #print(f"dt max_val after softplus: {dt.get_plain_text().max().item()}")
 
         # 将来の1文字生成（step）のために、現在の状態を記録（パディング処理）
         # xBC = (b l d -> b d l)
@@ -433,7 +457,8 @@ class Mamba2(nn.Module):
         assert u.shape[1] == 1, "Only one token can be decoded per inference step"
 
         # 次元をd_in_projとして巨大化する
-        zxbcdt = u.squeeze(1).matmul(self.in_proj_weight_crypt.t())  # (batch, d_in_proj)
+        zxbcdt = u.squeeze(1).matmul(self.in_proj_weight_crypt.t())
+
         #z, xBC, dt = torch.split(zxbcdt,[self.args.d_inner,self.args.d_inner + 2 * self.args.d_state,self.args.nheads,],dim=-1,)
         idx1 = self.args.d_inner
         idx2 = idx1 + (self.args.d_inner + 2 * self.args.d_state)
@@ -466,11 +491,15 @@ class Mamba2(nn.Module):
         x = xBC[..., :idx1]
         B = xBC[..., idx1:idx2]
         C = xBC[..., idx2:]
-        A = -MPCMamba_Function.exp(self.A_log_crypt,debug=2)  # (nheads,)
+        A = -MPCMamba_Function.exp(self.A_log_crypt)  # (nheads,)
 
         # SSMの更新式
         dt = MPCMamba_Function.softplus(dt + self.dt_bias_crypt)  # (batch, nheads)
-        dA = MPCMamba_Function.exp(dt * A,debug=3)  # (batch, nheads)
+        dA_arg = dt * A
+        dA_arg = MPCMamba_Function.clamp(dA_arg, min_val=-20.0, max_val=0.0)
+        dA = dA_arg.exp()
+
+
         # x = rearrange(x, "b (h p) -> b h p", p=self.args.headdim)
         batch,d_inner = x.shape[0],x.shape[1]
         nheads = d_inner // self.args.headdim
@@ -497,15 +526,27 @@ class Mamba2(nn.Module):
         y = y_4d.sum(dim=-1)
 
         # y = y + rearrange(self.D, "h -> h 1") * x
-        y = y + self.D_crypt.unsqueeze(-1) * x
+        def dbg3(name, t, limit=1e4, layer_id=None):
+            if layer_id == 3:
+                dbg(name, t, limit=limit, layer_id=layer_id)
 
-        # 後処理（正規化と次元整理）
-        # y = rearrange(y, "b h p -> b (h p)")
-        batch,nheads,headdim = y.shape[0],y.shape[1],y.shape[2]
-        y = y.reshape(batch,nheads*headdim)
+        y = y + self.D_crypt.unsqueeze(-1) * x
+        dbg3("after D skip", y, layer_id=self.layer_id)
+
+        batch, nheads, headdim = y.shape[0], y.shape[1], y.shape[2]
+        y = y.reshape(batch, nheads * headdim)
+
+        dbg3("before mixer RMSNorm", y, layer_id=self.layer_id)
+        dbg3("gate z before mixer RMSNorm", z, layer_id=self.layer_id)
 
         y = self.norm(y, z)
+
+        dbg3("after mixer RMSNorm / before out_proj", y, layer_id=self.layer_id)
+
+        # ここが怪しい
         y = y.matmul(self.out_proj_weight_crypt.t())
+
+        dbg3("after out_proj", y, layer_id=self.layer_id)
 
         return y.unsqueeze(1), h
     
@@ -554,7 +595,7 @@ class Mamba2(nn.Module):
 
         # 1. Compute the output for each intra-chunk (diagonal blocks)
         # Y =(L⊙CB)X
-        L = MPCMamba_Function.exp(segsum(A, device=self.device),debug=4)
+        L = MPCMamba_Function.exp(segsum(A, device=self.device))
         triu_mask_0 = torch.triu(torch.ones(self.args.chunk_size, self.args.chunk_size, device=self.device), diagonal=1)
         keep_mask = 1 - triu_mask_0
         L = L * crypten.cryptensor(keep_mask).to(self.device)
@@ -589,7 +630,7 @@ class Mamba2(nn.Module):
         # 2. Compute the state for each intra-chunk
         # (right term of low-rank factorization of off-diagonal blocks; B terms)
         # チャンク内の各単語の記憶が、チャンクの境界線に到達した時にどれくらい弱まっているか（引き継ぎ用の減衰率）を計算
-        decay_states = MPCMamba_Function.exp(A_cumsum[:, :, :, -1:] - A_cumsum,debug=5)
+        decay_states = MPCMamba_Function.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
 
         #states = torch.einsum("bclhn, bhcl, bclhp -> bchpn", B, decay_states, x)
         # ターゲット形状: (b, c, l, h, p, n)
@@ -612,7 +653,7 @@ class Mamba2(nn.Module):
         states = crypten.cat([crypt_initial_states, states], dim=1)
 
         # チャンクをまたぐ時の減衰
-        decay_chunk = MPCMamba_Function.exp(segsum(MPCMamba_Function.pad_left(A_cumsum[:, :, :, -1], 1), device=self.device),debug=6)
+        decay_chunk = MPCMamba_Function.exp(segsum(MPCMamba_Function.pad_left(A_cumsum[:, :, :, -1], 1), device=self.device))
         num_chunks_plus1 = decay_chunk.size(-1)
         triu_mask_c = torch.triu(torch.ones(num_chunks_plus1, num_chunks_plus1, device=self.device), diagonal=1)
         keep_mask_c = 1 - triu_mask_c
@@ -632,7 +673,7 @@ class Mamba2(nn.Module):
         # 4. Compute state -> output conversion per chunk
         # (left term of low-rank factorization of off-diagonal blocks; C terms)
         # 前のチャンクから引き継いだ記憶を、各チャンク内の64文字の単語たちに分配して、フェーズ1の結果と足し算
-        state_decay_out = MPCMamba_Function.exp(A_cumsum,debug=7)
+        state_decay_out = MPCMamba_Function.exp(A_cumsum)
 
         #Y_off = torch.einsum("bclhn, bchpn, bhcl -> bclhp", C, states, state_decay_out)
         # ターゲット形状: (b, c, l, h, p, n)
@@ -688,35 +729,64 @@ def segsum(x: MPCTensor, device: Device = None) -> MPCTensor:
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, d: int, debug: int, eps: float = 1e-5, device: Device = None):
+    def __init__(self, d: int, S: float = 1.0, eps: float = 1e-5,device: Device = None):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(d, device=device))
-        self.debug = debug
+        self.weight = nn.Parameter(torch.ones(d, device=device))
+        self.S = S
+        self.weight_crypt = None
+
+    def encrypt_weights(self):
+        if self.weight_crypt is None:
+            if isinstance(self.weight, crypten.mpc.MPCTensor):
+                self.weight_crypt = self.weight
+            else:
+                self.weight_crypt = crypten.cryptensor(self.weight).to(self.weight.device)
 
     def forward(self, x, z=None):
-        if z is not None:
-            x = x * MPCMamba_Function.silu(z)
-        
-        var = (x * x).sum(dim=-1, keepdim=True) / x.shape[-1]
-        #print(f"RMSNorm dubug ID:{self.debug}")
-        #print("var:", var.get_plain_text().abs().max().item())
-        #print("x:", x.get_plain_text().abs().max().item())
-        #print("result:", (x * MPCMamba_Function.rsqrt(var + self.eps) * self.weight).get_plain_text().abs().max().item())
-        var = MPCMamba_Function.clamp(var, min_val=1.0,max_val=4096.0)
-        u = var / 1024.0
 
-        return x * MPCMamba_Function.rsqrt(var + self.eps) * self.weight
+        self.encrypt_weights()
+
+        if DEBUG_PLAIN_RMSNORM:
+            xp = x.get_plain_text() if hasattr(x, "get_plain_text") else x
+
+            if z is not None:
+                zp = z.get_plain_text() if hasattr(z, "get_plain_text") else z
+                xp = xp * torch.nn.functional.silu(zp)
+
+            wp = (
+                self.weight_crypt.get_plain_text()
+                if hasattr(self.weight_crypt, "get_plain_text")
+                else self.weight_crypt
+            )
+
+            yp = xp * torch.rsqrt(xp.pow(2).mean(dim=-1, keepdim=True) + self.eps) * wp
+            return crypten.cryptensor(yp).to(x.device)
+    
+        S = self.S
+        if z is not None:
+            z_safe = MPCMamba_Function.clamp(z, min_val=-15.0, max_val=15.0)
+            g = MPCMamba_Function.silu(z_safe)
+            a_scaled = (x / S) * g
+        else:
+            a_scaled = x / S
+
+        var_scaled = (
+            (a_scaled * a_scaled).sum(dim=-1, keepdim=True)
+            / a_scaled.shape[-1]
+        )
+        eps_scaled = self.eps / (S * S)
+        var_scaled = MPCMamba_Function.clamp(
+            var_scaled,
+            min_val=1e-6,
+            max_val=1e4,
+        )
+        inv_rms_scaled = MPCMamba_Function.rsqrt(var_scaled + eps_scaled)
+        return a_scaled * inv_rms_scaled * self.weight_crypt
 
 class MPCMamba_Function():
     @staticmethod
-    def exp(x : MPCTensor,debug: int) -> MPCTensor:
-        #max_val = x.get_plain_text().max().item()
-        #min_val = x.get_plain_text().min().item()
-        #print(f"exp dubug ID:{debug}")
-        #print(f"exp input max: {max_val}")   
-        #print(f"exp input min: {min_val}")
-        x = MPCMamba_Function.clamp(x,min_val=-500.0,max_val = 10.0)   
+    def exp(x : MPCTensor) -> MPCTensor:
         return x.exp()
 
     @staticmethod
@@ -729,22 +799,19 @@ class MPCMamba_Function():
 
     @staticmethod
     def rsqrt(x : MPCTensor) -> MPCTensor:
-        max_val = x.get_plain_text().max().item()
-        print(f"rsqrt input max: {max_val}")   
-        x = MPCMamba_Function.clamp(x,max_val = 165.0)
         return x.inv_sqrt()
     
     @staticmethod
     def silu(x : MPCTensor) -> MPCTensor:
-        #x = MPCMamba_Function.clamp(x,max_val = 500.0)
-        return x * x.sigmoid()
+        x_for_sigmoid = MPCMamba_Function.clamp(x, min_val=-20.0, max_val=20.0)
+        return x * x_for_sigmoid.sigmoid()
     
     @staticmethod
     def softplus(x : MPCTensor) -> MPCTensor:
-        x = MPCMamba_Function.clamp(x, max_val=5.5)
-        result =  (x.exp() + 1.0).log()
-        return result
-    
+        x_pos = x.relu()
+        abs_x = x.relu() + (-x).relu()
+        return x_pos + (1.0 + (-abs_x).exp()).log()
+
     @staticmethod
     def clamp(x: crypten.mpc.MPCTensor, max_val=None, min_val=None):
         res = x
