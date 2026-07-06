@@ -14,14 +14,16 @@ from typing import Iterable, NamedTuple, TypeAlias, cast
 
 import torch
 import crypten
+import math
 from crypten.mpc import MPCTensor
 from torch import LongTensor, Tensor, nn
 
 
+
 Device: TypeAlias = str | torch.device | None
 
-DEBUG_MPC = False
-DEBUG_PLAIN_RMSNORM = True
+DEBUG_MPC = True
+DEBUG_PLAIN_RMSNORM = False
 
 def dbg(name, t, limit=1e4, layer_id=None):
     if not DEBUG_MPC:
@@ -120,7 +122,7 @@ class Mamba2LMHeadModel(nn.Module):
                                 # 状態空間モデル(SSM)
                                 mixer=Mamba2(args, device=device,  layer_id=i),
                                 # RMSNormによる層正規化
-                                norm=RMSNorm(args.d_model,S=8.0,device=device),
+                                norm=RMSNorm(args.d_model,device=device),
                             )
                         )
                         for i in range(args.n_layer)
@@ -128,7 +130,7 @@ class Mamba2LMHeadModel(nn.Module):
                 ),
 
                 # 最後に最終的な層正規化を行う
-                norm_f=RMSNorm(args.d_model,S=8.0, device=device),
+                norm_f=RMSNorm(args.d_model, device=device),
             )
         )
 
@@ -267,7 +269,7 @@ class Mamba2(nn.Module):
         self.D = nn.Parameter(torch.empty(args.nheads, device=device))
 
         # 正規化
-        self.norm = RMSNorm(args.d_inner,S=32.0, device=device)
+        self.norm = RMSNorm(args.d_inner, device=device)
         # d_inner次元からd_model次元へ変換
         self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=False, device=device)
 
@@ -526,27 +528,19 @@ class Mamba2(nn.Module):
         y = y_4d.sum(dim=-1)
 
         # y = y + rearrange(self.D, "h -> h 1") * x
-        def dbg3(name, t, limit=1e4, layer_id=None):
-            if layer_id == 3:
-                dbg(name, t, limit=limit, layer_id=layer_id)
 
         y = y + self.D_crypt.unsqueeze(-1) * x
-        dbg3("after D skip", y, layer_id=self.layer_id)
 
         batch, nheads, headdim = y.shape[0], y.shape[1], y.shape[2]
         y = y.reshape(batch, nheads * headdim)
 
-        dbg3("before mixer RMSNorm", y, layer_id=self.layer_id)
-        dbg3("gate z before mixer RMSNorm", z, layer_id=self.layer_id)
+        dbg("before mixer RMSNorm", y, layer_id=self.layer_id)
 
         y = self.norm(y, z)
 
-        dbg3("after mixer RMSNorm / before out_proj", y, layer_id=self.layer_id)
+        dbg("after mixer RMSNorm", y, layer_id=self.layer_id)
 
-        # ここが怪しい
         y = y.matmul(self.out_proj_weight_crypt.t())
-
-        dbg3("after out_proj", y, layer_id=self.layer_id)
 
         return y.unsqueeze(1), h
     
@@ -729,11 +723,10 @@ def segsum(x: MPCTensor, device: Device = None) -> MPCTensor:
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, d: int, S: float = 1.0, eps: float = 1e-5,device: Device = None):
+    def __init__(self, d: int, eps: float = 1e-5,device: Device = None):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(d, device=device))
-        self.S = S
         self.weight_crypt = None
 
     def encrypt_weights(self):
@@ -762,27 +755,24 @@ class RMSNorm(nn.Module):
 
             yp = xp * torch.rsqrt(xp.pow(2).mean(dim=-1, keepdim=True) + self.eps) * wp
             return crypten.cryptensor(yp).to(x.device)
-    
-        S = self.S
-        if z is not None:
-            z_safe = MPCMamba_Function.clamp(z, min_val=-15.0, max_val=15.0)
-            g = MPCMamba_Function.silu(z_safe)
-            a_scaled = (x / S) * g
         else:
-            a_scaled = x / S
+            if z is not None:
+                z_safe = MPCMamba_Function.clamp(z, min_val=-15.0, max_val=15.0)
+                g = MPCMamba_Function.silu(z_safe)
+                a_scaled = x * g
+            else:
+                a_scaled = x
 
-        var_scaled = (
-            (a_scaled * a_scaled).sum(dim=-1, keepdim=True)
-            / a_scaled.shape[-1]
-        )
-        eps_scaled = self.eps / (S * S)
-        var_scaled = MPCMamba_Function.clamp(
-            var_scaled,
-            min_val=1e-6,
-            max_val=1e4,
-        )
-        inv_rms_scaled = MPCMamba_Function.rsqrt(var_scaled + eps_scaled)
-        return a_scaled * inv_rms_scaled * self.weight_crypt
+            var_scaled = ((a_scaled * a_scaled).sum(dim=-1, keepdim=True)/ a_scaled.shape[-1])
+            eps_scaled = self.eps
+
+            dbg("var",var_scaled)
+
+            inv_rms_scaled = MPCMamba_Function.Rsqrt(var_scaled + eps_scaled,device=x.device)
+
+            dbg("inv_rms",inv_rms_scaled)
+
+            return a_scaled * inv_rms_scaled * self.weight_crypt
 
 class MPCMamba_Function():
     @staticmethod
@@ -864,3 +854,82 @@ class MPCMamba_Function():
             res.append(res[-1] + mpc_select(x, dim, i))
             
         return crypten.stack(res, dim=dim)
+    
+    @staticmethod
+    def pow(base, exponent):
+            if isinstance(base, (int, float)) and isinstance(exponent, (int, float)):
+                return base ** exponent
+            if isinstance(base, (int, float)):
+                return (exponent * math.log(base)).exp()
+
+            return (exponent * base.log()).exp()
+    
+    @staticmethod
+    def Drelu(x):
+        return x > 0
+    
+    @staticmethod
+    def Vss(x,y,beta):
+        return x * (1 - beta) + y * beta
+
+    @staticmethod
+    def ISPow(x,l=6,f=18):
+        alpha = 0
+        for i in range(l-1,-1,-1):
+            threshold = MPCMamba_Function.pow(2, 2*(i+1) + 2*alpha) * 2**f
+            c = MPCMamba_Function.Drelu(x - threshold)
+            delta = 2.0 ** i
+            alpha = alpha + (c * delta)
+        return alpha
+    
+    @staticmethod
+    def IEPow(x,l=6,f=18):
+        alpha = 0
+        for i in range(l-1,-1,-1):
+            threshold = MPCMamba_Function.pow(2,-(2*(i+1) + 2*alpha)) * 2**f
+            c = MPCMamba_Function.Drelu(threshold - x)
+            delta = 2.0 ** i
+            alpha = alpha + (c * delta)
+        return alpha
+    
+    @staticmethod
+    def IERsqrt(x,f=18,n=3,device: Device = None):
+        alphas = MPCMamba_Function.IEPow(x)
+        scale_in = MPCMamba_Function.pow(crypten.cryptensor(2, device=device), 2 * alphas)
+        x_scaled = x * scale_in
+        b = (-1.33 * x_scaled) + 2.33
+
+        for _ in range(n):
+            b = b * (1.5 - 0.5 * x_scaled * (b*b))
+            
+        scale_out = MPCMamba_Function.pow(crypten.cryptensor(2, device=device), alphas)
+        y = b * scale_out
+        
+        return y
+    
+    @staticmethod
+    def ISRsqrt(x,f=18,n=3,device: Device = None):
+        alphas =MPCMamba_Function.ISPow(x)
+        scale_in = MPCMamba_Function.pow(crypten.cryptensor(2, device=device), 2 * (alphas + 1))
+        x_scaled = x / scale_in
+        b = (-1.33 * x_scaled) + 2.33
+
+        for _ in range(n):
+            b = b * (1.5 - 0.5 * x_scaled * (b * b))
+
+        scale_out = MPCMamba_Function.pow(crypten.cryptensor(2, device=device), alphas + 1)
+        y = b / scale_out
+
+        return y
+
+    @staticmethod
+    def Rsqrt(x,device: Device = None):
+        x_prime = x - 0.25
+        beta = MPCMamba_Function.Drelu(x_prime)
+        y_0 = MPCMamba_Function.IERsqrt(x,device=device)
+        y_1 = MPCMamba_Function.ISRsqrt(x,device=device)
+        y = MPCMamba_Function.Vss(y_0,y_1,beta)
+        return y
+
+
+
